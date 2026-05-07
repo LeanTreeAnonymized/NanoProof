@@ -1,0 +1,871 @@
+from collections import Counter
+from dataclasses import dataclass
+import logging
+from typing import Callable, Self, TYPE_CHECKING
+import math
+import uuid
+
+from leantree.repl_adapter.server import LeanProofBranch
+from leantree.repl_adapter.interaction import LeanProcess, LeanProcessException
+from leantree.utils import RemoteException
+
+from nanoproof.common import (
+    TRACE,
+    pretty_print_tree,
+    theorem_to_example,
+    Player,
+    TimelineRecorder,
+)
+from nanoproof.cli import get_monitor
+
+if TYPE_CHECKING:
+    from nanoproof.inference import TacticModel, BlockingTacticModel
+
+logger = logging.getLogger(__name__)
+
+
+SOLVER_TACTIC_NAMES = ("grind", "lia", "grobner", "aesop")
+
+
+def is_solver_tactic(action) -> bool:
+    """True iff `action` is one of the disabled solver tactics, matched on its
+    first identifier. Matches `grind`, `grind +arith`, `grind?`, but rejects
+    `grindy_lemma` / `grinder`."""
+    if not isinstance(action, str):
+        return False
+    s = action.strip()
+    for name in SOLVER_TACTIC_NAMES:
+        if s == name:
+            return True
+        if s.startswith(name):
+            tail = s[len(name)]
+            if not tail.isalnum() and tail != "_":
+                return True
+    return False
+
+
+@dataclass
+class SearchConfig:
+    """MCTS search hyperparameters. All fields are required; use
+    :meth:`defaults` and :func:`nanoproof.common.add_dataclass_args` to
+    expose them as CLI flags.
+    """
+
+    pb_c_base: int  # MCTS UCB exploration base
+    pb_c_init: float  # MCTS UCB exploration init
+    value_discount: float  # discount applied to values during backprop
+    prior_temperature: float  # softmax temperature applied to action logprobs at expansion
+    no_legal_actions_value: float  # fallback value when MCTS reaches a node with no legal actions
+    c_and: float  # AND-node prior multiplier (cAND in AlphaProof)
+    unvisited_value_penalty: float  # subtracted from parent value to estimate V for unvisited children
+    ps_c: float  # progressive sampling coefficient
+    ps_alpha: float  # progressive sampling exponent
+    verify_timeout: int  # ms timeout for tactic re-check in verify_node
+
+    @classmethod
+    def defaults(cls) -> dict:
+        return {
+            "pb_c_base": 200,
+            "pb_c_init": 0.001,
+            "value_discount": 0.98,
+            "prior_temperature": 200.0,
+            "no_legal_actions_value": -5.0,
+            "c_and": 64.0,
+            "unvisited_value_penalty": 16.0,
+            "ps_c": 0.1,
+            "ps_alpha": 0.6,
+            "verify_timeout": 5000,
+        }
+
+
+Action = str | int
+State = list[LeanProofBranch]
+
+
+@dataclass
+class Node:
+    """Node in the search tree."""
+    parent: Self | None  # Not serialized.
+    # Action that was taken to reach this node.
+    action: Action | None
+    # Prior probability of the node according to the policy.
+    prior: float | None
+    # State after the action has been applied.
+    state: State
+    # Per-step reward obtained after applying the action.
+    reward: float | None
+    # Whether the node is an OR or AND node.
+    to_play: Player
+    is_solved: bool = False
+
+    visit_count: int = 0
+    evaluations: int = 0  # number of times this node was expanded
+    value_sum: float = 0
+    children: dict[Action, Self] | None = None
+
+    # Not used in search, but used as a regression target in RL.
+    value_target: float | None = None
+
+    # Unique ID for this node, assigned in __post_init__ if not provided.
+    id: str = ""
+
+    def __post_init__(self):
+        if not self.id:
+            self.id = str(uuid.uuid4())
+        assert (self.parent is None) == (self.action is None), (
+            f"Node __post_init__: parent={self.parent} action={self.action}"
+        )
+
+    def expanded(self) -> bool:
+        return self.children is not None
+
+    def value(self) -> float:
+        if self.visit_count == 0:
+            return 0
+        return self.value_sum / self.visit_count
+
+    def prior_sum(self) -> float:
+        return sum(child.prior for child in self.children.values())
+
+    @property
+    def is_terminal(self) -> bool:
+        return len(self.state) == 0
+
+    def calculate_solved(self) -> bool:
+        if self.is_terminal:
+            self.is_solved = True
+        elif not self.expanded():
+            self.is_solved = False
+        else:
+            if self.to_play == Player.OR:
+                self.is_solved = any(
+                    child.calculate_solved() for child in self.children.values()
+                )
+            else:
+                self.is_solved = all(
+                    child.calculate_solved() for child in self.children.values()
+                )
+        return self.is_solved
+
+    def pp_tree(self) -> str:
+        def get_children(node: Node):
+            return node.children.values() if node.children is not None else []
+
+        def get_node_label(node: Node):
+            state_str = (
+                "\n\n".join(str(branch.state) for branch in node.state)
+                if len(node.state) > 0
+                else "<empty>"
+            )
+            type_str = "AND" if node.to_play == Player.AND else "OR"
+            solved_str = " (SOLVED)" if node.is_solved else ""
+            value_target_str = (
+                f"[v={node.value_target:.2f}]" if node.value_target is not None else ""
+            )
+            return f"[{type_str}{solved_str}{value_target_str}]\nvis={node.visit_count} evals={node.evaluations} val={node.value():.2f}\n{state_str}"
+
+        def get_edge_label(node: Node):
+            if node.action is None:
+                return None
+            prior_str = f"p={node.prior:.2f}" if node.prior is not None else "p=None"
+            reward_str = f"r={node.reward:.2f}" if node.reward is not None else "r=None"
+            return f"[{prior_str} {reward_str}] {str(node.action)}"
+
+        return pretty_print_tree(
+            self,
+            get_children,
+            get_node_label,
+            get_edge_label,
+            max_label_len=200,
+            max_edge_label_len=50,
+        )
+
+    def serialize(self) -> dict:
+        """Serialize the node tree to a JSON-compatible dict."""
+        # Serialize state as list of state strings (LeanProofBranch objects can't be serialized)
+        state_strs = [str(branch.state) for branch in self.state] if self.state else []
+
+        # Serialize children recursively
+        children_data = None
+        if self.children is not None:
+            children_data = {
+                str(action): child.serialize()
+                for action, child in self.children.items()
+            }
+
+        return {
+            "id": self.id,
+            "parent_id": self.parent.id if self.parent else None,
+            "action": self.action,
+            "prior": self.prior,
+            "state": state_strs,
+            "reward": self.reward,
+            "to_play": self.to_play.value,
+            "is_solved": self.is_solved,
+            "visit_count": self.visit_count,
+            "evaluations": self.evaluations,
+            "value_sum": self.value_sum,
+            "value_target": self.value_target,
+            "children": children_data,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict, id_to_node: dict[str, Self] | None = None) -> Self:
+        """
+        Deserialize a node tree from a dict.
+
+        Creates MockProofBranch objects for the state so that transition
+        extraction code (which expects branch.state) works correctly.
+
+        Args:
+            data: The serialized node data.
+            id_to_node: Dict mapping node ids to node instances, used to look up parents.
+                        If None, a new dict is created (for the root node).
+        """
+        if id_to_node is None:
+            id_to_node = {}
+
+        # Create mock proof branches with .state attribute
+        state_strs = data.get("state", [])
+        state = [MockProofBranch(s) for s in state_strs]
+
+        # Look up parent from dict using parent_id
+        parent_id = data.get("parent_id")
+        parent = None
+        if parent_id:
+            assert parent_id in id_to_node, (
+                f"deserialize: Parent node not found: {parent_id}"
+            )
+            parent = id_to_node[parent_id]
+
+        # Create the node first (without children)
+        node = cls(
+            parent=parent,
+            action=data["action"],
+            prior=data["prior"],
+            state=state,
+            reward=data["reward"],
+            to_play=Player(data["to_play"]),
+            is_solved=data["is_solved"],
+            visit_count=data["visit_count"],
+            evaluations=data["evaluations"],
+            value_sum=data["value_sum"],
+            value_target=data.get("value_target"),
+            children=None,
+            id=data["id"],
+        )
+
+        # Add node to dict so children can look it up
+        id_to_node[node.id] = node
+
+        # Deserialize children recursively, passing the dict
+        if data.get("children") is not None:
+            children = {}
+            for action_str, child_data in data["children"].items():
+                # Try to convert action back to int if it was an int (for AND node children)
+                try:
+                    action = int(action_str)
+                except ValueError:
+                    action = action_str
+                children[action] = cls.deserialize(child_data, id_to_node)
+            node.children = children
+
+        return node
+
+    def clone(self) -> Self:
+        return self.deserialize(self.serialize())
+
+    def get_tree_nodes(self) -> list[Self]:
+        result = []
+        q = [self]
+        while q:
+            node = q.pop(0)
+            result.append(node)
+            if node.children is not None:
+                q.extend(node.children.values())
+        return result
+
+    def find_node_by_id(self, id: str) -> Self | None:
+        for node in self.get_tree_nodes():
+            if node.id == id:
+                return node
+        return None
+
+
+class MockProofBranch:
+    """Mock proof branch for deserialized nodes. Mimics LeanProofBranch.state."""
+
+    def __init__(self, state_str: str):
+        self.state = state_str
+
+    def __str__(self):
+        return self.state
+
+
+def verify_node(node: Node, timeout: int = 5000):
+    assert node.to_play == Player.OR, (
+        f"verify_node: Expected OR root, got {node.to_play}"
+    )
+    assert len(node.state) == 1, (
+        f"verify_node: Expected 1 branch at root, got {len(node.state)}"
+    )
+    init_branch = node.state[0]
+    to_verify = [(node, [init_branch])]
+    i = 0
+    while to_verify:
+        node, branches = to_verify.pop(0)
+        if node.to_play == Player.AND:
+            assert len(branches) == len(node.state), (
+                f"verify_node: {len(branches)=} != {len(node.state)=}"
+            )
+            for action, child in node.children.items():
+                assert isinstance(action, int), (
+                    f"verify_node: Expected int action below AND node, got {type(action)}"
+                )
+                assert child.to_play == Player.OR, (
+                    f"verify_node: Expected OR node below AND node, got {child.to_play}"
+                )
+                to_verify.append((child, child.state))
+        elif node.to_play == Player.OR:
+            assert len(branches) == 1, (
+                f"verify_node: Expected 1 branch at OR node, got {len(branches)}"
+            )
+            branch = branches[0]
+            solved_actions = [a for a in node.children if node.children[a].is_solved]
+            # More than one terminal node can be solved when expanding.
+            for action in solved_actions:
+                child = node.children[action]
+
+                result = branch.try_apply_tactic(action, timeout=timeout)
+                if not result.is_success():
+                    return f"verify_node: Tactic application error: '{result.error}'; state: '{branch.state}'; action: `{action}`"
+
+                new_branches = result.value
+                if len(new_branches) != len(child.state):
+                    return f"Unexpected number of branches after tactic application: {len(new_branches)=} != {len(child.state)=}; state: '{branch.state}'; action: `{action}`"
+                if len(new_branches) > 0:
+                    to_verify.append((child, new_branches))
+        else:
+            raise AssertionError(f"verify_node: Unknown node type: {node.to_play}")
+
+        i += 1
+        if i > 1000:
+            raise AssertionError(
+                f"verify_node: Exceeded maximum number of iterations ({i=})"
+            )
+
+
+def execute_tree(
+    root: Node, init_branch: LeanProofBranch, allow_premature_end: bool = False
+) -> list[tuple[Node, State]]:
+    """
+    Execute the tree starting from the initial branch. Return the actual obtained state for each node.
+    """
+    assert root.to_play == Player.OR, (
+        f"execute_tree: Expected OR root, got {root.to_play}"
+    )
+    assert len(root.state) == 1, (
+        f"execute_tree: Expected 1 branch at root, got {len(root.state)}"
+    )
+
+    node_to_state = []
+    to_execute = [(root, [init_branch])]
+    i = 0
+    while to_execute:
+        node, branches = to_execute.pop(0)
+        node_to_state.append((node, branches))
+        if node.to_play == Player.AND:
+            assert len(branches) == len(node.state) == len(node.children), (
+                f"execute_tree (AND): {len(branches)=} != {len(node.state)=} != {len(node.children)=}"
+            )
+            for branch, (action, child) in zip(branches, node.children.items()):
+                assert isinstance(action, int), (
+                    f"execute_tree (AND): Expected int action below AND node, got {type(action)}"
+                )
+                assert child.to_play == Player.OR, (
+                    f"execute_tree (AND): Expected OR node below AND node, got {child.to_play}"
+                )
+                to_execute.append((child, [branch]))
+        elif node.to_play == Player.OR:
+            assert len(branches) == 1, (
+                f"execute_tree (OR): Expected 1 branch at OR node, got {len(branches)}"
+            )
+            branch = branches[0]
+            solved_actions = [a for a in node.children if node.children[a].is_solved]
+            # More than one terminal node can be solved when expanding.
+            for action in solved_actions:
+                child = node.children[action]
+
+                result = branch.try_apply_tactic(action, timeout=5000)
+                assert result.is_success(), (
+                    f"execute_tree (OR): Tactic application error: '{result.error}'; state: '{branch.state}'; action: `{action}`"
+                )
+
+                new_branches = result.value
+                if len(new_branches) != len(child.state) and not (
+                    allow_premature_end and len(new_branches) == 0
+                ):
+                    raise AssertionError(
+                        f"execute_tree (OR): Unexpected number of branches after tactic application: {len(new_branches)=} != {len(child.state)=}; state: '{branch.state}'; action: `{action}`"
+                    )
+                if len(new_branches) > 0:
+                    to_execute.append((child, new_branches))
+        else:
+            raise AssertionError(f"execute_tree: Unknown node type: {node.to_play}")
+
+        i += 1
+        if i > 1000:
+            raise AssertionError(
+                f"execute_tree: Exceeded maximum number of iterations ({i=})"
+            )
+    return node_to_state
+
+
+def revive_tree_states(root: Node, theorem_str: str, lean_process: LeanProcess):
+    init_branch = lean_process.proof_from_sorry(theorem_to_example(theorem_str))
+    assert init_branch.is_success(), (
+        f"revive_tree_states: Failed to create initial branch: '{init_branch.error}'"
+    )
+    init_branch = init_branch.value
+    node_to_state = execute_tree(root, init_branch)
+    for node, state in node_to_state:
+        node.state = state
+
+
+class Game:
+    """A single episode of interaction with the environment."""
+    def __init__(self, theorem: str, num_simulations: int | None = None):
+        self.theorem = theorem
+        # Number of simulations to run.
+        self.num_simulations = num_simulations
+        # Number of iterations actually run (set by run_mcts)
+        self.num_iterations: int = 0
+        self.root: Node = None
+        self.unsimplified_root: Node = None
+
+
+class MCTSAbortedError(Exception):
+    """Raised when MCTS is aborted early (e.g., prover paused during evaluation)."""
+    pass
+
+
+def run_mcts(
+    config: SearchConfig,
+    game: Game,
+    model: "TacticModel | BlockingTacticModel",
+    expansion_callback=None,
+    abort_check=None,
+    timeline: TimelineRecorder | None = None,
+    tactic_sink: Callable[[str, list[tuple[str, str, int]]], None] | None = None,
+    inject_grind: bool = False,
+) -> int:
+    """
+    Run MCTS to find a proof.
+
+    Args:
+        config: MCTS configuration
+        game: The game to solve
+        model: Tactic model (local or remote)
+        expansion_callback: Optional callable() to call on each expansion
+        abort_check: Optional callable() -> bool that returns True if MCTS should abort early.
+                     This is checked each iteration and allows callers to cancel search
+                     (e.g., when prover is paused and needs to free Lean processes).
+        tactic_sink: Optional ``(state, [(tactic, status), ...])`` callback
+                     fired once per node expansion with the full batch of
+                     attempted tactics. ``status`` is one of ``"error"`` /
+                     ``"cycle"`` / ``"success"``.
+        inject_grind: If True, append ``"grind"`` to the model's tactic
+                     candidates at every node expansion (used during eval
+                     under ``--disable-solvers``).
+
+    Returns:
+        The number of iterations (simulations) that were run.
+
+    Raises:
+        MCTSAbortedError: If abort_check returns True during search.
+    """
+    root = game.root
+    num_iterations = 0
+    for i in range(game.num_simulations):
+        num_iterations = i + 1
+        if num_iterations % 100 == 0:
+            logger.debug(f"MCTS iteration {num_iterations}/{game.num_simulations}")
+        # Check if we should abort early (e.g., prover paused during evaluation)
+        if abort_check is not None and abort_check():
+            raise MCTSAbortedError("MCTS aborted: prover paused")
+        node = root
+        search_path = [node]
+
+        while (
+            node.expanded()
+            and len(node.children) > 0
+            and not progressive_sample(node, config)
+        ):
+            _, node = select_child(config, node)
+            search_path.append(node)
+
+        assert node.state is not None, (
+            f"run_mcts: node.state is None, node.id={node.id}"
+        )
+        if timeline:
+            with timeline.record("llm"):
+                result = model.sample_tactic(node.state)
+        else:
+            result = model.sample_tactic(node.state)
+        if not result.is_success():
+            if "State too long for model's rotary cache" in str(result.error):
+                continue
+            raise RuntimeError(f"Tactic/value prediction failed: {result.error}")
+        tactics, tactic_logprobs, value = result.value
+        value = -value  # convert to MCTS value scale (negative proof depth)
+
+        tactic_results = expand_node(
+            node,
+            tactics,
+            tactic_logprobs,
+            config.prior_temperature,
+            timeline=timeline,
+            abort_check=abort_check,
+            tactic_sink=tactic_sink,
+            inject_grind=inject_grind,
+        )
+
+        # Record expansion for monitoring
+        monitor = get_monitor()
+        if monitor is not None:
+            monitor.record_expansion()
+        if expansion_callback is not None:
+            expansion_callback()
+
+        pre_bp_path: list[tuple[float, int]] | None = None
+        if logger.isEnabledFor(TRACE):
+            pre_bp_path = [(n.value(), n.visit_count) for n in search_path]
+
+        diffs = backpropagate(
+            search_path,
+            value,
+            config,
+        )
+
+        if pre_bp_path is not None:
+            n_unique = len(tactic_results)
+            n_success = sum(1 for _, s, _ in tactic_results if s == "success")
+            n_error = sum(1 for _, s, _ in tactic_results if s == "error")
+            n_cycle = sum(1 for _, s, _ in tactic_results if s == "cycle")
+            no_legal_note = " NO_LEGAL" if n_success == 0 else ""
+            solved_note = " SOLVED" if root.is_solved else ""
+            logger.log(
+                TRACE,
+                f"i={i} d={len(search_path)} "
+                f"{_trace_format_path(search_path, pre_bp_path, diffs)} -> "
+                f"gen={n_success}/{n_unique}({n_error}err,{n_cycle}cyc) val={value}"
+                f"{no_legal_note}{solved_note}"
+            )
+
+        if root.is_solved:
+            break
+
+    game.num_iterations = num_iterations
+    # if not root.is_solved:
+    #     print(f"GIVING UP after {num_iterations} iterations")
+    return num_iterations
+
+
+def progressive_sample(node: Node, config: SearchConfig) -> bool:
+    """Whether to expand a node in the search tree again (progressive sampling)."""
+    return (
+        node.to_play == Player.OR
+        and node.evaluations <= config.ps_c * node.visit_count**config.ps_alpha
+    )
+
+
+def select_child(config: SearchConfig, node: Node) -> tuple[Action, Node]:
+    """Selects the child with the highest UCB score."""
+    _, action, child = max(
+        (ucb_score(config, node, child), action, child)
+        for action, child in node.children.items()
+    )
+    return action, child
+
+
+# The score for a node is based on its value, plus an exploration bonus based on
+# the prior.
+def ucb_score(config: SearchConfig, parent: Node, child: Node) -> float:
+    pb_c = (
+        math.log((parent.visit_count + config.pb_c_base + 1) / config.pb_c_base)
+        + config.pb_c_init
+    )
+    pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
+    if parent.to_play == Player.AND:
+        pb_c *= config.c_and
+
+    # Due to progressive sampling, we normalise priors here.
+    prior_score = pb_c * child.prior / parent.prior_sum()
+    if child.visit_count > 0:
+        value = child.reward + child.value()
+    else:
+        # Unvisited children: V(s,a) = V(parent) - penalty (AlphaProof paper).
+        value = parent.value() - config.unvisited_value_penalty
+    value_score = config.value_discount ** (-1 - value)
+
+    if parent.to_play == Player.AND:
+        # Invert value score for AND nodes.
+        value_score = 1 - value_score
+        if child.is_solved:
+            # Avoid re-selecting proven subgoals.
+            value_score = -1e9
+    return prior_score + value_score
+
+
+# If a new state is equal to the state of a parent, we are in a cycle.
+def is_cycling(node: Node, new_branches: list[LeanProofBranch]) -> bool:
+    p = node.parent
+    while p is not None:
+        if len(p.state) == len(new_branches) and all(
+            branch.state.semantic_equals(p_branch.state)
+            for branch, p_branch in zip(new_branches, p.state)
+        ):
+            return True
+        p = p.parent
+    return False
+
+
+# We expand a node using the value and sampled actions obtained from the neural
+# network. Immediately attempt the actions in the environment.
+def expand_node(
+    node: Node,
+    actions: list[str],
+    action_logprobs: list[float],
+    temperature: float,
+    timeline: TimelineRecorder | None = None,
+    abort_check=None,
+    tactic_sink: "Callable[[str, list[tuple[str, str, int]]], None] | None" = None,
+    inject_grind: bool = False,
+) -> list[tuple[str, str, int]]:
+    if inject_grind and "grind" not in actions:
+        actions = list(actions) + ["grind"]
+        action_logprobs = list(action_logprobs) + [max(action_logprobs, default=0.0)]
+    node.evaluations += 1
+    counts = Counter(actions)
+    policy = {
+        a: math.exp(logprob / temperature)
+        for a, logprob in zip(actions, action_logprobs)
+    }
+    node.children = {}
+    state_str = (
+        str(node.state[0].state).strip() if len(node.state) == 1 else "<multi-branch>"
+    )
+
+    # Collect (tactic, status, count) triples for this expansion and emit once
+    # at the end so the sink sees the whole batch generated for this state
+    # together. ``count`` is how many times the model sampled this tactic
+    # before dedup. We use try/finally so any partial results survive an abort
+    # or Lean crash mid-expansion.
+    tactic_results: list[tuple[str, str, int]] = []
+    try:
+        for action, p in policy.items():
+            if abort_check is not None and abort_check():
+                raise MCTSAbortedError("MCTS aborted during node expansion")
+            # Check if action is duplicate.
+            if action in node.children:
+                node.children[action].prior += p
+                continue
+            # Immediately apply the actions in the environment.
+            assert len(node.state) == 1
+            branch = node.state[0]
+            try:
+                if timeline:
+                    with timeline.record("lean"):
+                        new_branches = branch.try_apply_tactic(action)
+                else:
+                    new_branches = branch.try_apply_tactic(action)
+            except (
+                RemoteException,
+                LeanProcessException,
+                ConnectionError,
+                TimeoutError,
+            ) as e:
+                short_err = str(e).split("\n", 1)[0]
+                logger.warning(f"Lean crash on tactic {action!r}: {short_err}")
+                raise
+            if not new_branches.is_success():
+                # Invalid action encountered.
+                tactic_results.append((action, "error", counts[action]))
+                continue
+            if is_cycling(node, new_branches.value):
+                # Cycle detected.
+                tactic_results.append((action, "cycle", counts[action]))
+                continue
+            tactic_results.append((action, "success", counts[action]))
+            # new_branches = [b for b in new_branches.value if not b.state.is_solved()]
+            new_branches = new_branches.value
+            child = Node(
+                parent=node,
+                action=action,
+                prior=p,
+                state=new_branches,
+                to_play=Player.AND if len(new_branches) > 1 else Player.OR,
+                reward=-1.0,
+            )
+            if child.is_terminal:
+                child.is_solved = True
+                node.is_solved = True
+            node.children[action] = child
+            if len(new_branches) > 1:
+                # For AND nodes, immediately add children with pseudo-actions to focus on each goal.
+                child.children = {}
+                for i, branch in enumerate(new_branches):
+                    grandchild = Node(
+                        parent=child,
+                        action=i,
+                        prior=1.0 / len(new_branches),
+                        state=[branch],
+                        to_play=Player.OR,
+                        reward=0.0,
+                    )
+                    child.children[i] = grandchild
+    finally:
+        if tactic_sink is not None and tactic_results:
+            tactic_sink(state_str, tactic_results)
+    return tactic_results
+
+
+def close_leaves_with_grind(root: Node, timeout: int = 5000) -> int:
+    """Try ``grind`` on every unexpanded OR leaf in BFS (shallow-first) order.
+
+    Used during experience collection under ``--disable-solvers`` after MCTS
+    runs out of budget without a proof. For each leaf whose grind closes the
+    goal (returns no residual branches), attaches a single terminal ``grind``
+    child mimicking the structure produced by ``expand_node`` and marks the
+    leaf solved. Re-checks ``root.is_solved`` after each successful close so
+    we stop as soon as the theorem is proven.
+
+    Returns the number of leaves closed. Caller should consult
+    ``root.is_solved`` to decide whether the proof is complete.
+    """
+    leaves: list[Node] = []
+    q: list[Node] = [root]
+    while q:
+        n = q.pop(0)
+        if n.children is None:
+            if (
+                n.to_play == Player.OR
+                and not n.is_terminal
+                and not n.is_solved
+                and len(n.state) == 1
+            ):
+                leaves.append(n)
+        else:
+            q.extend(n.children.values())
+
+    closed = 0
+    for leaf in leaves:
+        # Skip if some ancestor is already solved (e.g. a sibling leaf was
+        # just closed by grind in this same pass). Without this guard we'd
+        # add a second solved child to an interior OR, which violates the
+        # "exactly one solved action" invariant that prune_redundant_node
+        # asserts.
+        p = leaf.parent
+        ancestor_solved = False
+        while p is not None:
+            if p.is_solved:
+                ancestor_solved = True
+                break
+            p = p.parent
+        if ancestor_solved:
+            continue
+        branch = leaf.state[0]
+        try:
+            result = branch.try_apply_tactic("grind", timeout=timeout)
+        except (
+            RemoteException,
+            LeanProcessException,
+            ConnectionError,
+            TimeoutError,
+        ) as e:
+            short_err = str(e).split("\n", 1)[0]
+            logger.warning(f"close_leaves_with_grind: Lean crash on grind: {short_err}")
+            continue
+        if not result.is_success():
+            continue
+        new_branches = result.value
+        if len(new_branches) != 0:
+            # grind didn't close the goal entirely; treat as failure.
+            continue
+        child = Node(
+            parent=leaf,
+            action="grind",
+            prior=1.0,
+            state=[],
+            to_play=Player.OR,
+            reward=-1.0,
+        )
+        child.is_solved = True
+        leaf.children = {"grind": child}
+        leaf.is_solved = True
+        closed += 1
+        root.calculate_solved()
+        if root.is_solved:
+            return closed
+    return closed
+
+
+def _trace_format_path(
+    search_path: list[Node],
+    pre_bp: list[tuple[float, int]],
+    diffs: list[float],
+) -> str:
+    """Render the selected path with pre-backprop (v, n) snapshots and the
+    per-node value diff produced by this iteration's backpropagation."""
+    parts = []
+    for i, node in enumerate(search_path):
+        v, n = pre_bp[i]
+        d = diffs[i]
+        if i == 0:
+            parts.append(f"[{v:.1f}({d:+.2f})/{n}]")
+        else:
+            tag = ""
+            if node.is_solved:
+                tag = ",SOL"
+            elif node.is_terminal:
+                tag = ",TERM"
+            parts.append(f"-[{v:.1f}({d:+.2f})/{n}{tag}]")
+    return "".join(parts)
+
+
+def backpropagate(
+    search_path: list[Node],
+    value: float,
+    config: SearchConfig,
+) -> list[float]:
+    """Propagate the evaluation up the tree. Returns the per-node value
+    diff (post.value() - pre.value()) for each node in *search_path*."""
+    pre_values = [n.value() for n in search_path]
+
+    if len(search_path[-1].children) == 0:
+        value = config.no_legal_actions_value
+    is_solved = False
+    for ix, node in reversed(list(enumerate(search_path))):
+        node.value_sum += value
+        node.visit_count += 1
+        if node.to_play == Player.AND:
+            is_solved = all(child.is_solved for child in node.children.values())
+        else:
+            is_solved |= node.is_solved
+        node.is_solved = is_solved
+
+        if ix != 0:  # we are not at the root yet - calculate the value for parent
+            if search_path[ix - 1].to_play == Player.AND:  # our parent is an AND node
+                value = backprop_value_towards_min(search_path[ix - 1])
+            else:
+                value = node.reward + value
+    return [n.value() - pv for n, pv in zip(search_path, pre_values)]
+
+
+def backprop_value_towards_min(node):
+    """Computes the value for an AND node by propagating the min value from children, corresponding to the longest/hardest unsolved proof branch."""
+    value = 1
+    for child in node.children.values():
+        if not child.is_solved and child.visit_count > 0:
+            value = min(value, child.value())
+    return value

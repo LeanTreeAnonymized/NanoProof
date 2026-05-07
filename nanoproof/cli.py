@@ -1,0 +1,2480 @@
+"""
+Web-based monitoring for the RL training loop.
+
+Provides a real-time web dashboard showing:
+- Training stats (loss, step, etc.)
+- Prover server status with thread-level indicators
+- GPU utilization and memory
+- Inference wait times
+- Tail of stdout.log / stderr.log from the run dir
+
+The monitor runs a Flask server in a background thread. The web app polls
+for state updates every second.
+"""
+
+import gzip
+import json
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from collections import deque
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from statistics import median
+from typing import Callable, Literal, TextIO, Any
+from queue import Queue
+
+from flask import Flask, jsonify, Response, send_from_directory, request
+
+from nanoproof.common import TimelineEvent, is_master
+
+# -----------------------------------------------------------------------------
+# Logging utilities
+# -----------------------------------------------------------------------------
+#
+# One logging path: stdlib `logging` for text, plus an fd-level tee of stdout
+# and stderr into <output_dir>/{stdout,stderr}.log so that anything any
+# process (including C extensions / subprocesses inheriting fd 1 or 2) writes
+# is persisted. Stderr carries the StreamHandler installed by
+# common.setup_default_logging, so logger.* records flow into stderr.log
+# automatically.
+
+_errors_lock = threading.Lock()
+_errors_file: TextIO | None = None
+_ddp_rank: int = 0
+
+# Dedup state for log_actionable_error: maps (component, error_first_line) ->
+# (last_write_monotonic, suppressed_count). Without this, a dead Lean server
+# can fill errors.jsonl with hundreds of thousands of identical entries.
+_error_dedup: dict[tuple[str, str], tuple[float, int]] = {}
+_error_dedup_window_seconds: float = 60.0
+
+
+def set_ddp_info(rank: int = 0):
+    """Record this process's DDP rank for the per-rank errors.jsonl filename."""
+    global _ddp_rank
+    _ddp_rank = rank
+
+
+def _tee_fd(target_fd: int, log_path: str, line_prefix: bytes) -> None:
+    """Redirect ``target_fd`` through a pipe; a reader thread writes everything
+    that flows through to ``log_path`` and echoes it to the original fd so the
+    terminal still shows live output. With a non-empty ``line_prefix``, the
+    prefix is prepended to every line written to the file (terminal echo
+    inherits the prefix too, which is fine - it disambiguates rank > 0).
+
+    The reader survives transient I/O failures on either sink: a single failed
+    write is logged once to /tmp and the sink is dropped, but the other keeps
+    going. If the reader cannot continue at all (e.g. an unexpected exception
+    on the read path), it restores ``saved_fd`` over ``target_fd`` and closes
+    the pipe before exiting, so subsequent writes from the main thread either
+    succeed against the original fd or raise BrokenPipeError - never silently
+    deadlock on pipe_write to a pipe nobody is draining."""
+    saved_fd = os.dup(target_fd)
+    r, w = os.pipe()
+    os.dup2(w, target_fd)
+    os.close(w)
+
+    def _emergency_log(msg: str) -> None:
+        try:
+            with open("/tmp/nanoproof-tee-crash.log", "a") as crash:
+                crash.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+        except Exception:
+            pass
+
+    def _write_all(fd: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+
+    def _reader():
+        f: Any = None
+        echo_alive = True
+        try:
+            f = open(log_path, "ab", buffering=0)
+        except Exception as e:
+            _emergency_log(f"tee-fd{target_fd}: open({log_path}) failed: {e!r}")
+        buf = b""
+        try:
+            while True:
+                chunk = os.read(r, 65536)
+                if not chunk:
+                    break
+                if echo_alive:
+                    try:
+                        _write_all(saved_fd, chunk)
+                    except Exception as e:
+                        echo_alive = False
+                        _emergency_log(
+                            f"tee-fd{target_fd}: terminal echo disabled: {e!r}"
+                        )
+                if f is not None:
+                    try:
+                        if line_prefix:
+                            buf += chunk
+                            while b"\n" in buf:
+                                line, _, buf = buf.partition(b"\n")
+                                f.write(line_prefix + line + b"\n")
+                        else:
+                            f.write(chunk)
+                    except Exception as e:
+                        _emergency_log(
+                            f"tee-fd{target_fd}: log write to {log_path} failed: {e!r}"
+                        )
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
+                        f = None
+                if not echo_alive and f is None:
+                    _emergency_log(
+                        f"tee-fd{target_fd}: both sinks dead, restoring saved_fd"
+                    )
+                    break
+        except BaseException as e:
+            _emergency_log(f"tee-fd{target_fd}: reader crashed: {type(e).__name__}: {e}")
+        finally:
+            # Restore the original fd so future writes from the main thread go
+            # straight to the saved terminal/log, then close the pipe read end
+            # so any writer currently blocked in pipe_write wakes with EPIPE
+            # instead of hanging forever.
+            try:
+                os.dup2(saved_fd, target_fd)
+            except Exception:
+                pass
+            try:
+                os.close(r)
+            except Exception:
+                pass
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_reader, daemon=True, name=f"tee-fd{target_fd}").start()
+
+
+def tee_stdio(output_dir: str, rank: int) -> None:
+    """Tee fd 1/2 to stdout.log/stderr.log under ``output_dir``. Call once per
+    process, after the run dir is created and before logging that should be
+    persisted. Rank-0 lines go in unprefixed; rank > 0 lines get a
+    ``[rank{N}] `` prefix so the merged file remains readable."""
+    prefix = b"" if rank == 0 else f"[rank{rank}] ".encode()
+    _tee_fd(1, os.path.join(output_dir, "stdout.log"), prefix)
+    _tee_fd(2, os.path.join(output_dir, "stderr.log"), prefix)
+    # Reopen sys.stdout/sys.stderr against the now-redirected fds with line
+    # buffering so prints flush promptly into the pipe (and thus the file).
+    sys.stdout = os.fdopen(1, "w", buffering=1)
+    sys.stderr = os.fdopen(2, "w", buffering=1)
+
+
+def configure_logging(output_dir: str | None):
+    """Open the per-rank ``rank{N}_errors.jsonl`` and tee stdout/stderr.
+
+    ``set_ddp_info`` must be called first so the rank is correct. ``output_dir``
+    None disables file output (useful for ad-hoc invocations / tests)."""
+    global _errors_file
+
+    with _errors_lock:
+        if _errors_file is not None:
+            _errors_file.close()
+            _errors_file = None
+
+        if output_dir is not None:
+            logging_dir = os.path.join(output_dir, "logging")
+            os.makedirs(logging_dir, exist_ok=True)
+            _errors_file = open(
+                os.path.join(logging_dir, f"rank{_ddp_rank}_errors.jsonl"), "a"
+            )
+            tee_stdio(output_dir, _ddp_rank)
+
+
+def log_actionable_error(component: str, error: str, **extra):
+    """Append a structured error to ``rank{N}_errors.jsonl`` in the run dir.
+
+    Use for errors that may need human attention (OOM, repeated actor
+    failures, etc.) - not for routine per-theorem failures.
+
+    Identical errors (same component + first line) are deduplicated within
+    a 60s window so a stuck/dead Lean server cannot fill the file with
+    hundreds of thousands of duplicate entries; the next emitted entry
+    carries ``suppressed_since_last`` with the count of skipped duplicates.
+    """
+    with _errors_lock:
+        if _errors_file is None:
+            return
+        key = (component, error.split("\n", 1)[0][:200])
+        now = time.monotonic()
+        last_time, suppressed = _error_dedup.get(key, (0.0, 0))
+        if last_time and (now - last_time) < _error_dedup_window_seconds:
+            _error_dedup[key] = (last_time, suppressed + 1)
+            return
+        _error_dedup[key] = (now, 0)
+        entry = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "rank": _ddp_rank,
+            "component": component,
+            "error": error,
+            **extra,
+        }
+        if suppressed > 0:
+            entry["suppressed_since_last"] = suppressed
+        _errors_file.write(json.dumps(entry) + "\n")
+        _errors_file.flush()
+
+
+def _tail_lines(path: str, n: int) -> list[str]:
+    """Return the last ``n`` lines of ``path`` as a list of strings (no trailing
+    newlines). Reads backward in 64 KiB chunks; missing files return []."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        chunk = 65536
+        data = b""
+        while end > 0 and data.count(b"\n") <= n:
+            read = min(chunk, end)
+            end -= read
+            f.seek(end)
+            data = f.read(read) + data
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    return lines[-n:]
+
+
+# -----------------------------------------------------------------------------
+# Data structures for state
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class LocalActorStatus:
+    """Status of a local actor thread."""
+
+    id: int
+    state: Literal["idle", "running", "blocked", "retry", "error"] = "idle"
+    games_played: int = 0
+    games_solved: int = 0
+    current_theorem: str = ""
+    last_update: float = field(default_factory=time.time)
+
+
+@dataclass
+class GPUStatus:
+    """Status of a GPU."""
+
+    id: int
+    name: str = "Unknown"
+    utilization: float = 0.0  # 0-100
+    memory_used: int = 0  # MB
+    memory_total: int = 0  # MB
+    inference_queue_size: int = 0
+    avg_wait_time_ms: float = 0.0
+
+
+@dataclass
+class LeanServerStatus:
+    """Status of the Lean server."""
+
+    address: str = ""
+    port: int = 0
+    connected: bool = False
+    available_processes: int = 0
+    # None when the last poll failed or hasn't run yet; we surface the gap
+    # rather than a misleading 0.  Metrics loggers skip None-valued fields
+    # so wandb shows a gap instead of a spurious zero on disconnected steps.
+    used_processes: int | None = None
+    max_processes: int = 0
+    cpu_percent: list[float] = field(default_factory=list)
+    ram_percent: float | None = None
+    ram_used_gb: float = 0.0
+    ram_total_gb: float = 0.0
+    # Resident memory of the leanserver Python process itself (not the host).
+    # Grow-over-time here is a memory leak in the leanserver; we've seen
+    # one instance grow to 110 GiB in production while its sibling stayed
+    # at 50 MiB on the same workload. Surfaced in /status via commit
+    # leantree/5a4b499. Populated only when the server is new enough to
+    # report it; 0 otherwise (treat as "unknown", not "zero").
+    leanserver_rss_gb: float = 0.0
+    # Currently-tracked proof branches on the server side. Useful to
+    # correlate with rss_gb to distinguish "branches_dict is big" from
+    # "something else in the python heap is big".
+    total_branches: int = 0
+    # Processes the pool is currently spawning (between slot reservation and
+    # REPL readiness). Surfaces startup stalls when they show up as a pile
+    # of "starting" that never transitions to "used".
+    starting_processes: int = 0
+    # Subprocesses the janitor is currently tearing down. Transient >0 after
+    # a recycle is normal; persistently >0 means teardown is wedged.
+    stopping_processes: int = 0
+    # Pool-alive count: idle + checked_out + starting + stopping.
+    total_processes: int = 0
+    # Tracked processes that haven't been touched in >60s. Leading indicator
+    # of the reaper firing; growth here means clients are leaking leases.
+    idle_too_long_60s: int = 0
+    last_update: float = field(default_factory=time.time)
+    error: str = ""
+
+
+@dataclass
+class CollectionStats:
+    """Statistics for the current collection phase."""
+
+    num_actors: int = 0
+    samples_collected: int = 0
+    target_samples: int = 0
+    proofs_attempted: int = 0
+    proofs_successful: int = 0
+    expansions: int = 0
+    start_time: float = 0.0
+    wait_times: list[float] = field(default_factory=list)
+    _wait_times_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record_wait_time(self, wait_time: float):
+        with self._wait_times_lock:
+            self.wait_times.append(wait_time)
+            # Keep only last 1000 samples
+            if len(self.wait_times) > 1000:
+                self.wait_times = self.wait_times[-1000:]
+
+    def get_wait_time_stats(self) -> tuple[float, float, float]:
+        """Returns (min, max, median) wait times, or (0, 0, 0) if no data."""
+        with self._wait_times_lock:
+            if not self.wait_times:
+                return (0.0, 0.0, 0.0)
+            return (min(self.wait_times), max(self.wait_times), median(self.wait_times))
+
+    def reset(self):
+        self.samples_collected = 0
+        self.target_samples = 0
+        self.proofs_attempted = 0
+        self.proofs_successful = 0
+        self.expansions = 0
+        self.start_time = time.time()
+        with self._wait_times_lock:
+            self.wait_times = []
+
+    @property
+    def success_rate(self) -> float:
+        if self.proofs_attempted == 0:
+            return 0.0
+        return self.proofs_successful / self.proofs_attempted
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.start_time if self.start_time > 0 else 0.0
+
+    def to_dict(self) -> dict:
+        wait_min, wait_max, wait_med = self.get_wait_time_stats()
+        return {
+            "num_actors": self.num_actors,
+            "samples_collected": self.samples_collected,
+            "target_samples": self.target_samples,
+            "proofs_attempted": self.proofs_attempted,
+            "proofs_successful": self.proofs_successful,
+            "success_rate": self.success_rate,
+            "expansions": self.expansions,
+            "elapsed": self.elapsed,
+            "wait_time_min": wait_min,
+            "wait_time_max": wait_max,
+            "wait_time_median": wait_med,
+        }
+
+
+@dataclass
+class EvalResult:
+    """Result from an evaluation run."""
+
+    step: int
+    dataset: str
+    success_rate: float
+    solved: int
+    total: int
+    errors: int
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class EvalProgress:
+    """Progress of the current evaluation."""
+
+    dataset: str = ""
+    current: int = 0
+    total: int = 0
+    solved: int = 0
+    errors: int = 0
+    active: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "dataset": self.dataset,
+            "current": self.current,
+            "total": self.total,
+            "solved": self.solved,
+            "errors": self.errors,
+            "active": self.active,
+            "progress_percent": (self.current / self.total * 100)
+            if self.total > 0
+            else 0,
+        }
+
+
+@dataclass
+class TrainingStats:
+    """Statistics for the current training step."""
+
+    step: int = 0
+    loss: float = 0.0
+    loss_positive: float = 0.0
+    loss_negative: float = 0.0
+    num_tokens: int = 0
+    learning_rate: float = 0.0
+
+
+Phase = Literal["idle", "collecting", "evaluating", "training"]
+
+
+# -----------------------------------------------------------------------------
+# Instrumentation payload helpers
+# -----------------------------------------------------------------------------
+
+# Max wall-clock spread between rank-duplicated phase events for the same
+# (name, action). DDP ranks sit behind a barrier so real transitions fire
+# within a handful of seconds; consecutive real transitions of the same kind
+# are much farther apart (whole phase durations). 10s is comfortably in the gap.
+_PHASE_DEDUP_WINDOW = 10.0
+
+
+def _clip_against(
+    start: float, end: float, intervals: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Clip ``(start, end)`` against a sorted list of non-overlapping
+    ``(s, e)`` intervals. Returns the sub-ranges that survive, each
+    strictly positive-length. Used to split an actor's ``llm`` event
+    around a training pause so the blocked-waiting portion is not
+    rendered as work."""
+    out = [(start, end)]
+    for a, b in intervals:
+        next_out: list[tuple[float, float]] = []
+        for s, e in out:
+            if e <= a or s >= b:
+                next_out.append((s, e))
+                continue
+            if s < a:
+                next_out.append((s, a))
+            if e > b:
+                next_out.append((b, e))
+        out = next_out
+    return [(s, e) for s, e in out if e > s]
+
+
+def _compact_instrumentation(
+    actors: dict[Any, list[dict]],
+    phases: list[dict],
+    outcomes: dict[Any, list[dict]],
+    mode: str,
+    since: float,
+) -> dict:
+    """Encode actor timelines, outcomes, and phase events into a compact,
+    gzip-friendly shape.
+
+    For each actor, emit a `llm` / `lean` array of interleaved
+    [start, end, start, end, ...] floats plus an `outcomes` list of
+    `{t, kind}` points. Halves the JSON size before gzip and removes most of
+    the parse overhead on the client.
+
+    `since` is a monotonic sequence cursor (see ``WebMonitor._instr_seq``).
+    Only events with seq > since are returned. Pass -inf to return everything
+    (e.g. initial load, or file mode where events don't carry a seq; missing
+    seq is treated as 0, which is > -inf so everything passes).
+    """
+    out_actors: dict[str, dict[str, Any]] = {}
+    max_cursor = since if since != float("-inf") else 0.0
+    for aid, events in actors.items():
+        llm: list[float] = []
+        lean: list[float] = []
+        for ev in events:
+            seq = ev.get("seq", 0)
+            if seq <= since:
+                continue
+            bucket = llm if ev["type"] == "llm" else lean
+            bucket.append(ev["start"])
+            bucket.append(ev["end"])
+            if seq > max_cursor:
+                max_cursor = seq
+        out_oc: list[dict] = []
+        for oc in outcomes.get(aid, []):
+            seq = oc.get("seq", 0)
+            if seq <= since:
+                continue
+            out_oc.append({"t": oc["t"], "kind": oc["kind"]})
+            if seq > max_cursor:
+                max_cursor = seq
+        if llm or lean or out_oc:
+            entry: dict[str, Any] = {"llm": llm, "lean": lean}
+            if out_oc:
+                entry["outcomes"] = out_oc
+            out_actors[str(aid)] = entry
+
+    # Phase events are semantically global (all DDP ranks transition together
+    # behind a barrier), but older run logs were written from every rank, so
+    # one transition shows up as N near-duplicate entries. Collapse groups
+    # with the same (name, action) that land within _PHASE_DEDUP_WINDOW of
+    # each other, keeping the earliest timestamp (which is what you'd want
+    # for "start of this phase").
+    out_phases = []
+    sorted_phases = sorted(phases, key=lambda p: p["time"])
+    last_by_key: dict[tuple[str, str], float] = {}
+    for ph in sorted_phases:
+        seq = ph.get("seq", 0)
+        if seq <= since:
+            continue
+        # Advance the cursor even for entries we end up deduping, so a future
+        # poll with since=cursor doesn't re-send the duplicates.
+        if seq > max_cursor:
+            max_cursor = seq
+        t = ph["time"]
+        key = (ph["name"], ph["action"])
+        last_t = last_by_key.get(key)
+        if last_t is not None and t - last_t < _PHASE_DEDUP_WINDOW:
+            # Extend the dedup window so a slow cascade (rank 7 lagging rank 0
+            # by 15s) still collapses as long as each step is within the window.
+            last_by_key[key] = t
+            continue
+        last_by_key[key] = t
+        out_phases.append({"name": ph["name"], "action": ph["action"], "t": t})
+
+    return {
+        "actors": out_actors,
+        "phases": out_phases,
+        "mode": mode,
+        "cursor": max_cursor,
+    }
+
+
+def _gzip_json(payload: dict) -> Response:
+    """Serialize payload as compact JSON, gzip, return with Content-Encoding header."""
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    body = gzip.compress(raw, compresslevel=6)
+    return Response(
+        body,
+        mimetype="application/json",
+        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+    )
+
+
+def _list_phase_steps(output_dir: str | None, prefix: str) -> list[int]:
+    """Scan ``output_dir`` for subdirs named ``<prefix><step>`` and return sorted steps."""
+    if not output_dir or not os.path.isdir(output_dir):
+        return []
+    steps: list[int] = []
+    for name in os.listdir(output_dir):
+        if not name.startswith(prefix):
+            continue
+        try:
+            steps.append(int(name[len(prefix) :]))
+        except ValueError:
+            continue
+    steps.sort()
+    return steps
+
+
+def _serve_jsonl_slice(path: str | None, args, key: str) -> Response:
+    """Return a slice of a JSONL file as ``{key: [...], total: int}``.
+
+    Query params: ``offset`` (default 0), ``limit`` (default 200, 0 = all).
+    404 if the file is missing (expected for steps that were skipped).
+    """
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        offset = max(0, int(args.get("offset", "0")))
+    except ValueError:
+        offset = 0
+    try:
+        limit = int(args.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    items: list[dict] = []
+    total = 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if offset <= total and (limit == 0 or len(items) < limit):
+                items.append(obj)
+            total += 1
+    return jsonify({key: items, "total": total})
+
+
+def _tree_depth_and_size(node: dict | None) -> tuple[int, int]:
+    """Return (depth, size) for a serialized search tree. Empty/None -> (0, 0)."""
+    if not node:
+        return 0, 0
+    size = 1
+    max_child_depth = 0
+    children = node.get("children") or {}
+    for child in children.values():
+        d, s = _tree_depth_and_size(child)
+        size += s
+        if d > max_child_depth:
+            max_child_depth = d
+    return max_child_depth + 1, size
+
+
+def _linearize_serialized_tree(node: dict | None) -> list[str] | None:
+    """Linearize a serialized solved proof tree into tactic strings.
+
+    Mirrors :func:`nanoproof.common.linearize_proof` but operates on the
+    JSON form already on disk so we don't need to rehydrate Node objects
+    just to render a proof in the web UI. ``to_play`` is 1 (OR) / 2 (AND).
+    """
+    if not node or not node.get("is_solved"):
+        return None
+    tactics: list[str] = []
+
+    def dfs(n: dict) -> None:
+        if not n.get("is_solved"):
+            return
+        to_play = n.get("to_play")
+        children = n.get("children") or {}
+        if to_play == 1:  # OR
+            if not children:
+                return  # terminal OR node
+            solved = [(a, c) for a, c in children.items() if c.get("is_solved")]
+            if not solved:
+                return
+            action, child = min(solved, key=lambda kv: len(str(kv[0])))
+            tactics.append(str(action))
+            dfs(child)
+        elif to_play == 2:  # AND
+            for _, child in children.items():
+                dfs(child)
+
+    dfs(node)
+    return tactics
+
+
+_step_stats_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _step_stats(path: str | None) -> dict:
+    """Count attempts (proven/unproven/error) and transitions in a
+    ``theorems.jsonl`` file (mtime-cached)."""
+    empty = {
+        "num_attempts": 0,
+        "num_proven": 0,
+        "num_unproven": 0,
+        "num_errors": 0,
+        "num_transitions": 0,
+    }
+    if not path or not os.path.exists(path):
+        return empty
+    mtime = os.path.getmtime(path)
+    cached = _step_stats_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    stats = dict(empty)
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            stats["num_attempts"] += 1
+            stats["num_transitions"] += len(obj.get("transitions", []))
+            outcome = obj.get("outcome")
+            if outcome == "proven":
+                stats["num_proven"] += 1
+            elif outcome == "unproven":
+                stats["num_unproven"] += 1
+            elif outcome == "error":
+                stats["num_errors"] += 1
+    _step_stats_cache[path] = (mtime, stats)
+    return stats
+
+
+def _attempt_summary_row(obj: dict) -> dict:
+    full_depth, full_size = _tree_depth_and_size(obj.get("full_tree"))
+    simp_depth, simp_size = _tree_depth_and_size(obj.get("simplified_tree"))
+    return {
+        "dataset": obj.get("dataset"),
+        "id": obj.get("id"),
+        "theorem": obj.get("theorem"),
+        "outcome": obj.get("outcome"),
+        "error": obj.get("error"),
+        "num_simulations": obj.get("num_simulations", 0),
+        "num_iterations": obj.get("num_iterations", 0),
+        "num_transitions": len(obj.get("transitions", [])),
+        "full_tree_depth": full_depth,
+        "full_tree_size": full_size,
+        "simplified_tree_depth": simp_depth,
+        "simplified_tree_size": simp_size,
+    }
+
+
+def _serve_attempts_summary(path: str | None) -> Response:
+    """Return lightweight per-attempt summaries from a ``theorems.jsonl`` file.
+
+    Full trees are expensive (50-200KB each) so we only return per-attempt
+    metadata here; clients fetch trees via :func:`_serve_attempt_entry`.
+    """
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Not found"}), 404
+    attempts: list[dict] = []
+    total_transitions = 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            row = _attempt_summary_row(obj)
+            total_transitions += row["num_transitions"]
+            attempts.append(row)
+    return jsonify(
+        {
+            "attempts": attempts,
+            "total": len(attempts),
+            "total_transitions": total_transitions,
+        }
+    )
+
+
+def _serve_attempt_entry(path: str | None, index: int) -> Response:
+    """Return the full record (trees + transitions) for one attempt.
+
+    Augments proven attempts with a ``proof`` field carrying the
+    linearized Lean source (theorem with ``sorry`` replaced by tactics)
+    so the Data tab modal can render it without re-walking the tree
+    in JS.
+    """
+    from nanoproof.common import construct_proof_source
+
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Not found"}), 404
+    i = 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if i == index:
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    return jsonify({"error": "Index out of range"}), 404
+                if obj.get("outcome") == "proven":
+                    tactics = _linearize_serialized_tree(obj.get("simplified_tree"))
+                    src = obj.get("theorem")
+                    if tactics and src and src.strip().endswith("sorry"):
+                        obj["proof"] = construct_proof_source(src, tactics)
+                return jsonify(obj)
+            i += 1
+    return jsonify({"error": "Index out of range"}), 404
+
+
+def _serve_step_transitions(path: str | None, args) -> Response:
+    """Flatten transitions across all proven attempts in a ``theorems.jsonl`` file.
+
+    Query params: ``offset`` (default 0), ``limit`` (default 200, 0 = all).
+    """
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        offset = max(0, int(args.get("offset", "0")))
+    except ValueError:
+        offset = 0
+    try:
+        limit = int(args.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    items: list[dict] = []
+    total = 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            theorem_id = obj.get("id")
+            for t in obj.get("transitions", []):
+                if offset <= total and (limit == 0 or len(items) < limit):
+                    items.append(
+                        {
+                            "id": theorem_id,
+                            "state": t[0],
+                            "tactic": t[1],
+                            "value": t[2],
+                        }
+                    )
+                total += 1
+    return jsonify({"transitions": items, "total": total})
+
+
+# -----------------------------------------------------------------------------
+# Web Monitor
+# -----------------------------------------------------------------------------
+
+
+class WebMonitor:
+    """
+    Web-based monitor for the RL training loop.
+
+    Runs a Flask server in a background thread that serves:
+    - A React web app for visualization
+    - API endpoints for state polling and log streaming
+    """
+
+    def __init__(self, num_actors: int = 0, enabled: bool = True, port: int = 5050):
+        self.enabled = enabled
+        self.port = port
+        self._lock = threading.Lock()
+
+        # Output directory for replay buffers and logs
+        self.output_dir: str | None = None
+
+        # Current state
+        self.phase: Phase = "idle"
+        self.step: int = 0
+        self.replay_buffer_size: int = 0
+        self.replay_buffer_base_size: int = 0  # Size at start of collection
+        self.negative_buffer_size: int = 0
+
+        # Collection stats
+        self.collection = CollectionStats(num_actors=num_actors)
+
+        # Training stats
+        self.training = TrainingStats()
+
+        # Evaluation history
+        self.eval_history: deque[EvalResult] = deque(maxlen=50)
+
+        # Current evaluation progress
+        self.eval_progress = EvalProgress()
+
+        # Local actors
+        self.local_actors: dict[int, LocalActorStatus] = {}
+
+        # GPU status
+        self.gpus: list[GPUStatus] = []
+
+        # Lean server status (single server for local mode)
+        self.lean_server: LeanServerStatus = LeanServerStatus()
+
+        # Multiple lean servers (for distributed mode monitoring)
+        self.lean_servers: list[LeanServerStatus] = []
+
+        # Matchmaker (set by RL training loop). Used by /api/theorems/* to
+        # list datasets and to recompute per-attempt weights using the same
+        # config the live training loop is using.
+        self.matchmaker = None  # type: ignore[assignment]
+
+        # Timeline instrumentation
+        self.actor_timelines: dict[int, deque] = {}  # actor_id -> deque of event dicts
+        self.actor_outcomes: dict[int, deque] = {}  # actor_id -> deque of outcome dicts
+        self.phase_events: deque[dict] = deque(maxlen=10000)  # global phase start/end markers
+
+        # LLM profiler instrumentation (per GPU rank). Populated by a
+        # background thread that polls each rank's Flask inference server's
+        # /llm_timeline endpoint.
+        self.llm_endpoints: dict[int, str] = {}  # rank -> "host:port"
+        self.llm_events: dict[int, deque] = {}  # rank -> deque of {start,end,seq}
+        self.llm_samples: dict[int, deque] = {}  # rank -> deque of {t,n,seq}
+        self.llm_remote_cursor: dict[
+            int, float
+        ] = {}  # rank -> last seq seen from that server
+        self._llm_out_seq = 0  # outgoing monotonic seq for delta polls
+        self._llm_poll_thread: threading.Thread | None = None
+        self._llm_poll_interval = 2.0
+        # inference_timeline.jsonl: persistent log mirroring llm_events /
+        # llm_samples so the profiler tab works in standalone mode on a
+        # finished run. Each line is either a "event" (inference interval)
+        # or a "sample" (queue-depth sample). Phase events are read from
+        # the sibling timeline.jsonl so we don't duplicate them.
+        self._inference_timeline_file: TextIO | None = None
+        self._inference_file_cache: dict[str, Any] = {"mtime": None, "body": None}
+        self._timeline_file: TextIO | None = None
+        self.mode: str = "live"  # "live" or "standalone"
+        self._max_timeline_events_per_actor = 10000
+        # Monotonic counter attached to every actor event, outcome, and phase
+        # event. Delta polls filter by seq > since so we never lose an event
+        # whose start/end happens to sit before the previous cursor (which used
+        # to happen for long-running LLM calls: a short Lean event on another
+        # actor could advance the cursor past the long call's start, then the
+        # long call's events were dropped on the next poll once flushed).
+        self._instr_seq = 0
+
+        # Cache for standalone (post-hoc) instrumentation reads. Keyed by
+        # timeline.jsonl mtime so we only re-parse when the file changes.
+        self._instr_file_cache: dict[str, Any] = {"mtime": None, "body": None}
+
+        # Server thread
+        self._server_thread: threading.Thread | None = None
+        self._gpu_monitor_thread: threading.Thread | None = None
+        self._lean_monitor_thread: threading.Thread | None = None
+        self._lean_servers_monitor_thread: threading.Thread | None = None
+        self._stop_monitors = threading.Event()
+        self._app: Flask | None = None
+
+        if enabled:
+            self._start_server()
+            self._start_gpu_monitor()
+
+    def _start_server(self):
+        """Start the Flask server in a background thread."""
+        self._app = self._create_app()
+
+        def run_server():
+            log_handler = logging.getLogger("werkzeug")
+            log_handler.setLevel(logging.ERROR)
+            self._app.run(host="0.0.0.0", port=self.port, threaded=True)
+
+        self._server_thread = threading.Thread(target=run_server, daemon=True)
+        self._server_thread.start()
+
+        url = f"http://localhost:{self.port}"
+        print(f"\n{'=' * 60}")
+        print(f"  Web Monitor: {url}")
+        print(f"{'=' * 60}\n")
+
+    def _start_gpu_monitor(self):
+        """Start a background thread to monitor GPU status."""
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+        except ImportError:
+            return
+
+        def monitor_gpus():
+            # Map PyTorch indices to physical GPU IDs
+            # If CUDA_VISIBLE_DEVICES is set, parse it to get physical IDs
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if cuda_visible:
+                physical_ids = [
+                    int(x.strip()) for x in cuda_visible.split(",") if x.strip()
+                ]
+            else:
+                physical_ids = list(range(torch.cuda.device_count()))
+
+            while not self._stop_monitors.wait(timeout=2.0):
+                try:
+                    # Query all GPUs at once for efficiency and reliability
+                    result = subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0,
+                    )
+                    if result.returncode != 0:
+                        continue  # Keep previous values on failure
+
+                    all_gpu_stats = {}
+                    for line in result.stdout.strip().split("\n"):
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 4:
+                            gpu_idx = int(parts[0])
+                            all_gpu_stats[gpu_idx] = {
+                                "utilization": float(parts[1]),
+                                "memory_used": int(parts[2]),
+                                "memory_total": int(parts[3]),
+                            }
+
+                    for i in range(torch.cuda.device_count()):
+                        props = torch.cuda.get_device_properties(i)
+                        physical_id = physical_ids[i] if i < len(physical_ids) else i
+
+                        if physical_id in all_gpu_stats:
+                            stats = all_gpu_stats[physical_id]
+                            self.update_gpu(
+                                gpu_id=i,
+                                name=props.name,
+                                utilization=stats["utilization"],
+                                memory_used=stats["memory_used"],
+                                memory_total=stats["memory_total"],
+                            )
+                        # If physical_id not found, keep previous values
+                except Exception:
+                    pass  # Keep previous values on error
+
+        self._gpu_monitor_thread = threading.Thread(target=monitor_gpus, daemon=True)
+        self._gpu_monitor_thread.start()
+
+    def set_lean_server(self, address: str, port: int):
+        """Configure the Lean server address and start monitoring."""
+        with self._lock:
+            self.lean_server.address = address
+            self.lean_server.port = port
+
+        # Start the Lean server monitor if not already running
+        if self._lean_monitor_thread is None and self.enabled:
+            self._start_lean_monitor()
+
+    def set_lean_servers(self, server_urls: list[str]):
+        """
+        Configure multiple Lean servers for monitoring (distributed mode).
+
+        Args:
+            server_urls: List of server URLs in format "host:port"
+        """
+        with self._lock:
+            self.lean_servers = []
+            for url in server_urls:
+                if ":" in url:
+                    host, port = url.rsplit(":", 1)
+                    try:
+                        port_int = int(port)
+                    except ValueError:
+                        port_int = 8000
+                else:
+                    host = url
+                    port_int = 8000
+
+                server = LeanServerStatus(address=host, port=port_int)
+                self.lean_servers.append(server)
+
+        # Start the multi-server monitor if not already running
+        if self._lean_servers_monitor_thread is None and self.enabled:
+            self._start_lean_servers_monitor()
+
+    def _start_lean_servers_monitor(self):
+        """Start a background thread to monitor multiple Lean servers."""
+
+        def monitor_lean_servers():
+            while not self._stop_monitors.wait(timeout=3.0):
+                with self._lock:
+                    servers = self.lean_servers[:]
+
+                for server in servers:
+                    if not server.address or not server.port:
+                        continue
+
+                    try:
+                        url = f"http://{server.address}:{server.port}/status"
+                        req = urllib.request.Request(url, method="GET")
+                        req.add_header("Accept", "application/json")
+
+                        with urllib.request.urlopen(req, timeout=5.0) as response:
+                            data = json.loads(response.read().decode())
+
+                        with self._lock:
+                            server.connected = True
+                            server.available_processes = data.get(
+                                "available_processes", 0
+                            )
+                            server.used_processes = data.get("used_processes", 0)
+                            server.max_processes = data.get("max_processes", 0)
+                            server.cpu_percent = data.get("cpu_percent_per_core", [])
+                            ram = data.get("ram", {})
+                            server.ram_percent = ram.get("percent", 0.0)
+                            server.ram_used_gb = ram.get("used_bytes", 0) / (1024**3)
+                            server.ram_total_gb = ram.get("total_bytes", 0) / (1024**3)
+                            # 0 when the leanserver is old enough not to report
+                            # this field yet; the metric reader can filter those.
+                            rss_bytes = data.get("leanserver_rss_bytes") or 0
+                            server.leanserver_rss_gb = rss_bytes / (1024**3)
+                            server.total_branches = data.get("total_branches", 0)
+                            server.starting_processes = data.get(
+                                "starting_processes", 0
+                            )
+                            server.stopping_processes = data.get(
+                                "stopping_processes", 0
+                            )
+                            server.total_processes = data.get("total_processes", 0)
+                            server.idle_too_long_60s = data.get(
+                                "idle_too_long_60s", 0
+                            )
+                            server.last_update = time.time()
+                            server.error = ""
+                    except Exception as e:
+                        with self._lock:
+                            server.connected = False
+                            server.error = str(e)
+                            # Null the observables we surface so callers can
+                            # distinguish "down" from "idle".
+                            server.ram_percent = None
+                            server.used_processes = None
+
+        self._lean_servers_monitor_thread = threading.Thread(
+            target=monitor_lean_servers, daemon=True
+        )
+        self._lean_servers_monitor_thread.start()
+
+    def set_matchmaker(self, matchmaker) -> None:
+        with self._lock:
+            self.matchmaker = matchmaker
+
+    def set_llm_endpoints(self, endpoints: list[str]):
+        """Register per-rank inference server endpoints for LLM profiler.
+
+        ``endpoints[i]`` is the "host:port" for rank ``i``. Only called on
+        master; starts a background thread that polls each rank's
+        ``/llm_timeline`` and stores events + queue-depth samples for the
+        LLM profiler tab.
+        """
+        with self._lock:
+            self.llm_endpoints = {i: e for i, e in enumerate(endpoints)}
+            for i in range(len(endpoints)):
+                self.llm_events.setdefault(i, deque(maxlen=20000))
+                self.llm_samples.setdefault(i, deque(maxlen=100000))
+                self.llm_remote_cursor.setdefault(i, float("-inf"))
+        if self._llm_poll_thread is None and self.enabled:
+            self._start_llm_poll()
+
+    def _start_llm_poll(self):
+        """Start a background thread that polls every rank's /llm_timeline."""
+
+        def poll():
+            while not self._stop_monitors.wait(timeout=self._llm_poll_interval):
+                with self._lock:
+                    endpoints = list(self.llm_endpoints.items())
+                    cursors = dict(self.llm_remote_cursor)
+                for rank, endpoint in endpoints:
+                    try:
+                        url = f"http://{endpoint}/llm_timeline?since={cursors[rank]}"
+                        req = urllib.request.Request(url)
+                        req.add_header("Accept", "application/json")
+                        with urllib.request.urlopen(req, timeout=5.0) as resp:
+                            data = json.loads(resp.read().decode())
+                    except Exception:
+                        continue
+                    with self._lock:
+                        buf_events = self.llm_events[rank]
+                        buf_samples = self.llm_samples[rank]
+                        f = self._inference_timeline_file
+                        for ev in data.get("events", []):
+                            self._llm_out_seq += 1
+                            trigger = ev.get("trigger", "unknown")
+                            buf_events.append(
+                                {
+                                    "start": ev["start"],
+                                    "end": ev["end"],
+                                    "seq": self._llm_out_seq,
+                                    "trigger": trigger,
+                                }
+                            )
+                            if f is not None:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "type": "event",
+                                            "rank": rank,
+                                            "start": ev["start"],
+                                            "end": ev["end"],
+                                            "trigger": trigger,
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                        for s in data.get("samples", []):
+                            self._llm_out_seq += 1
+                            buf_samples.append(
+                                {
+                                    "t": s["t"],
+                                    "n": s["n"],
+                                    "seq": self._llm_out_seq,
+                                }
+                            )
+                            if f is not None:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "type": "sample",
+                                            "rank": rank,
+                                            "t": s["t"],
+                                            "n": s["n"],
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                        if f is not None:
+                            f.flush()
+                        cursor = data.get("cursor")
+                        if cursor is not None and cursor > self.llm_remote_cursor[rank]:
+                            self.llm_remote_cursor[rank] = cursor
+
+        self._llm_poll_thread = threading.Thread(target=poll, daemon=True)
+        self._llm_poll_thread.start()
+
+    def _start_lean_monitor(self):
+        """Start a background thread to monitor Lean server status."""
+
+        def monitor_lean():
+            while not self._stop_monitors.wait(timeout=3.0):
+                with self._lock:
+                    address = self.lean_server.address
+                    port = self.lean_server.port
+
+                if not address or not port:
+                    continue
+
+                try:
+                    url = f"http://{address}:{port}/status"
+                    req = urllib.request.Request(url, method="GET")
+                    req.add_header("Accept", "application/json")
+
+                    with urllib.request.urlopen(req, timeout=5.0) as response:
+                        data = json.loads(response.read().decode())
+
+                    with self._lock:
+                        self.lean_server.connected = True
+                        self.lean_server.available_processes = data.get(
+                            "available_processes", 0
+                        )
+                        self.lean_server.used_processes = data.get("used_processes", 0)
+                        self.lean_server.max_processes = data.get("max_processes", 0)
+                        self.lean_server.cpu_percent = data.get(
+                            "cpu_percent_per_core", []
+                        )
+                        ram = data.get("ram", {})
+                        self.lean_server.ram_percent = ram.get("percent", 0.0)
+                        self.lean_server.ram_used_gb = ram.get("used_bytes", 0) / (
+                            1024**3
+                        )
+                        self.lean_server.ram_total_gb = ram.get("total_bytes", 0) / (
+                            1024**3
+                        )
+                        self.lean_server.starting_processes = data.get(
+                            "starting_processes", 0
+                        )
+                        self.lean_server.stopping_processes = data.get(
+                            "stopping_processes", 0
+                        )
+                        self.lean_server.total_processes = data.get(
+                            "total_processes", 0
+                        )
+                        self.lean_server.idle_too_long_60s = data.get(
+                            "idle_too_long_60s", 0
+                        )
+                        self.lean_server.last_update = time.time()
+                        self.lean_server.error = ""
+                except Exception as e:
+                    with self._lock:
+                        self.lean_server.connected = False
+                        self.lean_server.error = str(e)
+
+        self._lean_monitor_thread = threading.Thread(target=monitor_lean, daemon=True)
+        self._lean_monitor_thread.start()
+
+    def _create_app(self) -> Flask:
+        """Create the Flask application."""
+        # Determine static folder path
+        web_dist = os.path.join(os.path.dirname(__file__), "web", "dist")
+        if not os.path.exists(web_dist):
+            web_dist = None
+
+        app = Flask(__name__, static_folder=web_dist, static_url_path="")
+
+        @app.route("/")
+        def index():
+            if web_dist and os.path.exists(os.path.join(web_dist, "index.html")):
+                return send_from_directory(web_dist, "index.html")
+            return self._fallback_html()
+
+        @app.route("/api/state")
+        def get_state():
+            return jsonify(self._get_state())
+
+        @app.route("/api/stdout")
+        def get_stdout():
+            return jsonify({"lines": self._tail_run_log("stdout.log", 1000)})
+
+        @app.route("/api/stderr")
+        def get_stderr():
+            return jsonify({"lines": self._tail_run_log("stderr.log", 1000)})
+
+        @app.route("/api/steps")
+        def list_collections():
+            """List available collection steps with per-step attempt / outcome / transition counts."""
+            steps = _list_phase_steps(self.output_dir, "step_")
+            entries: list[dict] = []
+            total_attempts = 0
+            total_proven = 0
+            total_unproven = 0
+            total_errors = 0
+            total_transitions = 0
+            for s in steps:
+                path = self._phase_file(f"step_{s:05d}", "theorems.jsonl")
+                stats = _step_stats(path)
+                entries.append(
+                    {
+                        "step": s,
+                        "num_attempts": stats["num_attempts"],
+                        "num_proven": stats["num_proven"],
+                        "num_unproven": stats["num_unproven"],
+                        "num_errors": stats["num_errors"],
+                        "num_transitions": stats["num_transitions"],
+                    }
+                )
+                total_attempts += stats["num_attempts"]
+                total_proven += stats["num_proven"]
+                total_unproven += stats["num_unproven"]
+                total_errors += stats["num_errors"]
+                total_transitions += stats["num_transitions"]
+            return jsonify(
+                {
+                    "steps": [e["step"] for e in entries],
+                    "entries": entries,
+                    "total_attempts": total_attempts,
+                    "total_proven": total_proven,
+                    "total_unproven": total_unproven,
+                    "total_errors": total_errors,
+                    "total_transitions": total_transitions,
+                }
+            )
+
+        @app.route("/api/evals")
+        def list_evals():
+            """List available eval steps (directories under ``evals/``)."""
+            with self._lock:
+                output_dir = self.output_dir
+            if not output_dir:
+                return jsonify({"steps": []})
+            evals_dir = os.path.join(output_dir, "evals")
+            if not os.path.isdir(evals_dir):
+                return jsonify({"steps": []})
+            steps = []
+            for name in os.listdir(evals_dir):
+                try:
+                    steps.append(int(name))
+                except ValueError:
+                    continue
+            steps.sort()
+            return jsonify({"steps": steps})
+
+        @app.route("/api/steps/<int:step>/theorems")
+        def list_step_attempts(step: int):
+            """Attempt summaries for a step (no trees - fetch detail separately)."""
+            return _serve_attempts_summary(
+                self._phase_file(f"step_{step:05d}", "theorems.jsonl"),
+            )
+
+        @app.route("/api/steps/<int:step>/theorems/<int:index>")
+        def get_step_attempt(step: int, index: int):
+            """Full detail (trees + transitions) for one attempt in a step."""
+            return _serve_attempt_entry(
+                self._phase_file(f"step_{step:05d}", "theorems.jsonl"),
+                index,
+            )
+
+        @app.route("/api/steps/<int:step>/transitions")
+        def get_step_transitions(step: int):
+            return _serve_step_transitions(
+                self._phase_file(f"step_{step:05d}", "theorems.jsonl"),
+                request.args,
+            )
+
+        @app.route("/api/steps/<int:step>/generated_tactics")
+        def get_step_tactics(step: int):
+            return _serve_jsonl_slice(
+                self._phase_file(f"step_{step:05d}", "generated_tactics.jsonl"),
+                request.args,
+                "tactics",
+            )
+
+        @app.route("/api/steps/<int:step>/train_data")
+        def get_step_train_data(step: int):
+            return _serve_jsonl_slice(
+                self._phase_file(f"step_{step:05d}", "train_subsample.jsonl"),
+                request.args,
+                "samples",
+            )
+
+        @app.route("/api/evals/<int:step>/generated_tactics")
+        def get_eval_tactics(step: int):
+            return _serve_jsonl_slice(
+                self._phase_file(
+                    os.path.join("evals", f"{step:05d}"), "generated_tactics.jsonl"
+                ),
+                request.args,
+                "tactics",
+            )
+
+        @app.route("/api/theorems/datasets")
+        def list_theorem_datasets():
+            """Return the matchmaker's loaded datasets and theorem counts."""
+            mm = self.matchmaker
+            if mm is None:
+                return jsonify({"datasets": []})
+            counts: dict[str, int] = {}
+            for t in mm.theorems:
+                counts[t.dataset] = counts.get(t.dataset, 0) + 1
+            return jsonify(
+                {
+                    "datasets": [
+                        {"name": name, "theorem_count": counts.get(name, 0)}
+                        for name in mm.datasets
+                    ]
+                }
+            )
+
+        @app.route("/api/theorems/<dataset>/<path:theorem_id>")
+        def get_theorem_history(dataset: str, theorem_id: str):
+            """Return the per-step history for one ``(dataset, id)`` theorem.
+
+            Walks every ``step_*/theorems.jsonl`` shard in step order,
+            collects matching attempts, and replays them through the same
+            :class:`TheoremStats` logic the matchmaker uses so the client can
+            display the running weight after each attempt. For each proven
+            attempt, also linearizes the simplified proof tree and renders the
+            full Lean source via :func:`construct_proof_source` so the UI can
+            show the proof directly.
+            """
+            from nanoproof.experience_collection import (  # local import: keeps cli.py decoupled at import time
+                TheoremStats,
+                list_step_shards,
+            )
+            from nanoproof.common import construct_proof_source
+
+            output_dir = self.output_dir
+            if not output_dir:
+                return jsonify({"error": "No output dir"}), 404
+
+            mm = self.matchmaker
+            if mm is None:
+                return jsonify({"error": "Matchmaker not ready"}), 503
+            config = mm.config
+
+            theorem_source: str | None = None
+            idx = mm._index.get((dataset, theorem_id))
+            if idx is not None:
+                theorem_source = mm.theorems[idx].source
+
+            stats = TheoremStats()
+            history: list[dict] = []
+            for step, shard_path in list_step_shards(output_dir):
+                with open(shard_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if obj.get("dataset") != dataset or obj.get("id") != theorem_id:
+                            continue
+                        if theorem_source is None:
+                            theorem_source = obj.get("theorem")
+                        stats.update(obj["outcome"], obj.get("proof_size"))
+                        proof_source: str | None = None
+                        if obj.get("outcome") == "proven":
+                            tactics = _linearize_serialized_tree(obj.get("simplified_tree"))
+                            src = obj.get("theorem")
+                            if tactics and src and src.strip().endswith("sorry"):
+                                proof_source = construct_proof_source(src, tactics)
+                        history.append(
+                            {
+                                "step": step,
+                                "outcome": obj.get("outcome"),
+                                "error": obj.get("error"),
+                                "num_simulations": obj.get("num_simulations", 0),
+                                "num_iterations": obj.get("num_iterations", 0),
+                                "num_transitions": len(obj.get("transitions", [])),
+                                "proof_size": obj.get("proof_size"),
+                                "weight_after": stats.weight(config),
+                                "proof": proof_source,
+                            }
+                        )
+            return jsonify(
+                {
+                    "dataset": dataset,
+                    "id": theorem_id,
+                    "theorem": theorem_source,
+                    "history": history,
+                    "current_weight": stats.weight(config),
+                }
+            )
+
+        @app.route("/api/instrumentation")
+        def get_instrumentation():
+            """Get live timeline instrumentation data (compact + gzipped).
+
+            Query params:
+              since (int/float, optional): monotonic sequence cursor (see
+                WebMonitor._instr_seq). Only events with seq > since are
+                returned. Clients use this to fetch deltas so long runs don't
+                re-download history on every poll; seq (rather than a
+                wall-clock start time) keeps late-flushed long LLM events from
+                being dropped when shorter events on other actors have already
+                advanced a time-based cursor.
+            """
+            try:
+                since = float(request.args.get("since", "-inf"))
+            except ValueError:
+                since = float("-inf")
+            with self._lock:
+                actors_src = {
+                    aid: list(evs) for aid, evs in self.actor_timelines.items()
+                }
+                outcomes_src = {
+                    aid: list(ocs) for aid, ocs in self.actor_outcomes.items()
+                }
+                phases_src = list(self.phase_events)
+                mode = self.mode
+            payload = _compact_instrumentation(
+                actors_src, phases_src, outcomes_src, mode, since
+            )
+            return _gzip_json(payload)
+
+        @app.route("/api/llm_instrumentation")
+        def get_llm_instrumentation():
+            """Per-rank LLM inference timeline + pending-queue depth samples.
+
+            Query params:
+              since (float, optional): monotonic seq cursor; only items with
+                seq > since are returned. See `_llm_out_seq`.
+            """
+            try:
+                since = float(request.args.get("since", "-inf"))
+            except ValueError:
+                since = float("-inf")
+            out_ranks: dict[str, dict] = {}
+            max_cursor = since if since != float("-inf") else 0.0
+            with self._lock:
+                rank_ids = sorted(self.llm_endpoints.keys())
+                for rank in rank_ids:
+                    # Flat interleaved [s0,e0,s1,e1,...] for inference intervals,
+                    # parallel arrays for samples. Same compact shape as the
+                    # actor profiler so the frontend rendering is familiar.
+                    ev_flat: list[float] = []
+                    ev_triggers: list[str] = []
+                    for ev in self.llm_events.get(rank, ()):
+                        if ev["seq"] <= since:
+                            continue
+                        ev_flat.append(ev["start"])
+                        ev_flat.append(ev["end"])
+                        ev_triggers.append(ev.get("trigger", "unknown"))
+                        if ev["seq"] > max_cursor:
+                            max_cursor = ev["seq"]
+                    sample_ts: list[float] = []
+                    sample_ns: list[int] = []
+                    for s in self.llm_samples.get(rank, ()):
+                        if s["seq"] <= since:
+                            continue
+                        sample_ts.append(s["t"])
+                        sample_ns.append(s["n"])
+                        if s["seq"] > max_cursor:
+                            max_cursor = s["seq"]
+                    out_ranks[str(rank)] = {
+                        "inferencing": ev_flat,
+                        "inferencing_trigger": ev_triggers,
+                        "sample_t": sample_ts,
+                        "sample_n": sample_ns,
+                    }
+                phases_src = list(self.phase_events)
+                mode = self.mode
+            # Reuse the phase dedup logic from the actor profiler so the
+            # frontend can draw the same phase lines / overlays for context.
+            out_phases = []
+            sorted_phases = sorted(phases_src, key=lambda p: p["time"])
+            last_by_key: dict[tuple[str, str], float] = {}
+            for ph in sorted_phases:
+                t = ph["time"]
+                key = (ph["name"], ph["action"])
+                last_t = last_by_key.get(key)
+                if last_t is not None and t - last_t < _PHASE_DEDUP_WINDOW:
+                    last_by_key[key] = t
+                    continue
+                last_by_key[key] = t
+                out_phases.append({"name": ph["name"], "action": ph["action"], "t": t})
+            payload = {
+                "ranks": out_ranks,
+                "phases": out_phases,
+                "mode": mode,
+                "cursor": max_cursor,
+            }
+            return _gzip_json(payload)
+
+        @app.route("/api/llm_instrumentation/file")
+        def get_llm_instrumentation_file():
+            """Serve inference_timeline.jsonl contents for standalone mode.
+
+            Phase events are read from the sibling timeline.jsonl since phases
+            are shared between the actor and LLM profilers. Response is cached
+            by the inference file's mtime.
+            """
+            with self._lock:
+                output_dir = self.output_dir
+            if not output_dir:
+                return jsonify({"error": "No output directory"}), 404
+
+            inf_path = os.path.join(output_dir, "inference_timeline.jsonl")
+            phase_path = os.path.join(output_dir, "timeline.jsonl")
+            if not os.path.exists(inf_path):
+                return _gzip_json({"ranks": {}, "phases": [], "mode": self.mode})
+
+            try:
+                mtime = os.path.getmtime(inf_path)
+            except OSError as e:
+                return jsonify({"error": str(e)}), 500
+
+            cached_body = None
+            if self._inference_file_cache["mtime"] == mtime:
+                cached_body = self._inference_file_cache["body"]
+
+            if cached_body is None:
+                rank_events: dict[int, list[float]] = {}
+                rank_triggers: dict[int, list[str]] = {}
+                rank_sample_t: dict[int, list[float]] = {}
+                rank_sample_n: dict[int, list[int]] = {}
+                phases: list[dict] = []
+                try:
+                    with open(inf_path, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            entry = json.loads(line)
+                            rank = int(entry.get("rank", 0))
+                            t = entry.get("type")
+                            if t == "event":
+                                rank_events.setdefault(rank, []).extend(
+                                    [entry["start"], entry["end"]]
+                                )
+                                rank_triggers.setdefault(rank, []).append(
+                                    entry.get("trigger", "unknown")
+                                )
+                            elif t == "sample":
+                                rank_sample_t.setdefault(rank, []).append(entry["t"])
+                                rank_sample_n.setdefault(rank, []).append(entry["n"])
+                    if os.path.exists(phase_path):
+                        with open(phase_path, "r") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                entry = json.loads(line)
+                                if entry.get("type") == "phase":
+                                    phases.append(
+                                        {
+                                            "name": entry["name"],
+                                            "action": entry["action"],
+                                            "time": entry["time"],
+                                        }
+                                    )
+                except Exception as e:
+                    return jsonify({"error": str(e)}), 500
+
+                # Phase dedup across DDP ranks (same logic as the live endpoint).
+                out_phases: list[dict] = []
+                sorted_phases = sorted(phases, key=lambda p: p["time"])
+                last_by_key: dict[tuple[str, str], float] = {}
+                for ph in sorted_phases:
+                    pt = ph["time"]
+                    key = (ph["name"], ph["action"])
+                    last_t = last_by_key.get(key)
+                    if last_t is not None and pt - last_t < _PHASE_DEDUP_WINDOW:
+                        last_by_key[key] = pt
+                        continue
+                    last_by_key[key] = pt
+                    out_phases.append(
+                        {"name": ph["name"], "action": ph["action"], "t": pt}
+                    )
+
+                rank_ids = sorted(set(rank_events.keys()) | set(rank_sample_t.keys()))
+                out_ranks: dict[str, dict] = {}
+                for r in rank_ids:
+                    out_ranks[str(r)] = {
+                        "inferencing": rank_events.get(r, []),
+                        "inferencing_trigger": rank_triggers.get(r, []),
+                        "sample_t": rank_sample_t.get(r, []),
+                        "sample_n": rank_sample_n.get(r, []),
+                    }
+                payload = {
+                    "ranks": out_ranks,
+                    "phases": out_phases,
+                    "mode": self.mode,
+                }
+                cached_body = gzip.compress(
+                    json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                    compresslevel=6,
+                )
+                self._inference_file_cache["mtime"] = mtime
+                self._inference_file_cache["body"] = cached_body
+
+            return Response(
+                cached_body,
+                mimetype="application/json",
+                headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+            )
+
+        @app.route("/api/instrumentation/file")
+        def get_instrumentation_file():
+            """Serve timeline.jsonl contents in compact+gzipped form, cached by mtime."""
+            with self._lock:
+                output_dir = self.output_dir
+            if not output_dir:
+                return jsonify({"error": "No output directory"}), 404
+
+            timeline_path = os.path.join(output_dir, "timeline.jsonl")
+            if not os.path.exists(timeline_path):
+                return _gzip_json({"actors": {}, "phases": [], "mode": self.mode})
+
+            try:
+                mtime = os.path.getmtime(timeline_path)
+            except OSError as e:
+                return jsonify({"error": str(e)}), 500
+
+            cached_body = None
+            if self._instr_file_cache["mtime"] == mtime:
+                cached_body = self._instr_file_cache["body"]
+
+            if cached_body is None:
+                actors: dict[str, list] = {}
+                outcomes: dict[str, list] = {}
+                phases: list[dict] = []
+                try:
+                    with open(timeline_path, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            entry = json.loads(line)
+                            t = entry.get("type")
+                            if t == "phase":
+                                phases.append(entry)
+                            elif t == "actor":
+                                aid = str(entry["actor"])
+                                actors.setdefault(aid, []).append(
+                                    {
+                                        "type": entry["event"],
+                                        "start": entry["start"],
+                                        "end": entry["end"],
+                                    }
+                                )
+                            elif t == "outcome":
+                                aid = str(entry["actor"])
+                                outcomes.setdefault(aid, []).append(
+                                    {
+                                        "t": entry["t"],
+                                        "kind": entry["kind"],
+                                    }
+                                )
+                except Exception as e:
+                    return jsonify({"error": str(e)}), 500
+                payload = _compact_instrumentation(
+                    actors, phases, outcomes, self.mode, float("-inf")
+                )
+                cached_body = gzip.compress(
+                    json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                    compresslevel=6,
+                )
+                self._instr_file_cache["mtime"] = mtime
+                self._instr_file_cache["body"] = cached_body
+
+            return Response(
+                cached_body,
+                mimetype="application/json",
+                headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+            )
+
+        return app
+
+    def _fallback_html(self) -> str:
+        """Fallback HTML when web app is not built."""
+        return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>NanoProof Monitor</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { color: #00d9ff; }
+        .card { background: #16213e; border-radius: 8px; padding: 16px; margin: 16px 0; }
+        .stat { display: inline-block; margin-right: 24px; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #00d9ff; }
+        .stat-label { font-size: 12px; color: #888; }
+        .phase { padding: 4px 12px; border-radius: 4px; font-weight: bold; }
+        .phase-collecting { background: #22c55e; color: #000; }
+        .phase-training { background: #3b82f6; color: #fff; }
+        .phase-evaluating { background: #eab308; color: #000; }
+        .phase-idle { background: #666; color: #fff; }
+        pre { background: #0f0f1a; padding: 12px; border-radius: 4px; overflow-x: auto; max-height: 300px; }
+        .prover-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+        .prover-server { background: #1e3a5f; padding: 12px; border-radius: 8px; min-width: 200px; }
+        .thread-grid { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+        .thread { width: 20px; height: 20px; border-radius: 4px; }
+        .thread-running { background: #22c55e; }
+        .thread-idle { background: #666; }
+        .thread-blocked { background: #eab308; }
+        .thread-error { background: #ef4444; }
+        .gpu-bar { height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 4px; }
+        .gpu-bar-fill { height: 100%; background: linear-gradient(90deg, #22c55e, #eab308, #ef4444); }
+        .logs { font-family: monospace; font-size: 12px; line-height: 1.4; }
+        .log-entry { padding: 2px 0; border-bottom: 1px solid #222; }
+        .log-time { color: #666; }
+        .log-component { color: #00d9ff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>NanoProof Monitor</h1>
+        <div id="app">Loading...</div>
+    </div>
+    <script>
+        async function fetchState() {
+            try {
+                const res = await fetch('/api/state');
+                const state = await res.json();
+                renderState(state);
+            } catch (e) {
+                document.getElementById('app').innerHTML = '<p>Error loading state</p>';
+            }
+        }
+        
+        function renderState(s) {
+            const phaseClass = 'phase-' + s.phase;
+            let html = `
+                <div class="card">
+                    <span class="phase ${phaseClass}">${s.phase.toUpperCase()}</span>
+                    <span style="margin-left: 16px;">Step ${s.step}</span>
+                </div>
+                
+                <div class="card">
+                    <h3>Stats</h3>
+                    <div class="stat"><div class="stat-value">${s.collection.samples_collected}/${s.collection.target_samples}</div><div class="stat-label">Samples</div></div>
+                    <div class="stat"><div class="stat-value">${s.collection.proofs_successful}</div><div class="stat-label">Proofs Found</div></div>
+                    <div class="stat"><div class="stat-value">${(s.collection.success_rate * 100).toFixed(1)}%</div><div class="stat-label">Success Rate</div></div>
+                    <div class="stat"><div class="stat-value">${s.replay_buffer_size}</div><div class="stat-label">Buffer Size</div></div>
+                    <div class="stat"><div class="stat-value">${s.negative_buffer_size}</div><div class="stat-label">Negatives</div></div>
+                </div>
+
+                <div class="card">
+                    <h3>Training</h3>
+                    <div class="stat"><div class="stat-value">${s.training.loss.toFixed(6)}</div><div class="stat-label">Loss</div></div>
+                    <div class="stat"><div class="stat-value">${s.training.loss_positive.toFixed(6)}</div><div class="stat-label">Loss (pos)</div></div>
+                    <div class="stat"><div class="stat-value">${s.training.loss_negative.toFixed(6)}</div><div class="stat-label">Loss (neg)</div></div>
+                    <div class="stat"><div class="stat-value">${s.training.num_tokens.toLocaleString()}</div><div class="stat-label">Tokens</div></div>
+                </div>
+            `;
+            
+            // GPUs
+            if (s.gpus.length > 0) {
+                html += '<div class="card"><h3>GPUs</h3>';
+                for (const gpu of s.gpus) {
+                    const memPct = gpu.memory_total > 0 ? (gpu.memory_used / gpu.memory_total * 100) : 0;
+                    html += `<div style="margin: 8px 0;">
+                        <div>GPU ${gpu.id}: ${gpu.name}</div>
+                        <div>Util: ${gpu.utilization.toFixed(0)}% | Mem: ${gpu.memory_used}/${gpu.memory_total} MB | Queue: ${gpu.inference_queue_size} | Wait: ${gpu.avg_wait_time_ms.toFixed(1)}ms</div>
+                        <div class="gpu-bar"><div class="gpu-bar-fill" style="width: ${memPct}%"></div></div>
+                    </div>`;
+                }
+                html += '</div>';
+            }
+            
+            // Eval history
+            if (s.eval_history.length > 0) {
+                html += '<div class="card"><h3>Evaluations</h3><pre>';
+                for (const e of s.eval_history.slice(-10)) {
+                    html += `Step ${e.step} | ${e.dataset}: ${(e.success_rate * 100).toFixed(1)}% (${e.solved}/${e.total})\n`;
+                }
+                html += '</pre></div>';
+            }
+            
+            // Logs
+            html += `<div class="card">
+                <h3>stderr <button onclick="fetchLogs()">Refresh</button></h3>
+                <div id="stderr-log" class="logs" style="max-height: 240px; overflow-y: auto;"></div>
+                <h3 style="margin-top: 16px;">stdout</h3>
+                <div id="stdout-log" class="logs" style="max-height: 240px; overflow-y: auto;"></div>
+            </div>`;
+
+            document.getElementById('app').innerHTML = html;
+            fetchLogs();
+        }
+
+        async function _fillPane(url, paneId) {
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                const pane = document.getElementById(paneId);
+                if (!pane) return;
+                pane.innerHTML = data.lines.slice(-1000).map(line =>
+                    `<div class="log-entry">${line.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</div>`
+                ).join('');
+                pane.scrollTop = pane.scrollHeight;
+            } catch (e) {}
+        }
+
+        async function fetchLogs() {
+            await Promise.all([
+                _fillPane('/api/stderr', 'stderr-log'),
+                _fillPane('/api/stdout', 'stdout-log'),
+            ]);
+        }
+        
+        fetchState();
+        setInterval(fetchState, 1000);
+    </script>
+</body>
+</html>
+"""
+
+    def _get_state(self) -> dict:
+        """Get the current state as a JSON-serializable dict."""
+        with self._lock:
+            return {
+                "mode": self.mode,
+                "phase": self.phase,
+                "step": self.step,
+                # During collection, show live count (base + collected)
+                "replay_buffer_size": (
+                    self.replay_buffer_base_size + self.collection.samples_collected
+                    if self.phase == "collecting"
+                    else self.replay_buffer_size
+                ),
+                "negative_buffer_size": self.negative_buffer_size,
+                "output_dir": self.output_dir,
+                "collection": self.collection.to_dict(),
+                "training": {
+                    "step": self.training.step,
+                    "loss": self.training.loss,
+                    "loss_positive": self.training.loss_positive,
+                    "loss_negative": self.training.loss_negative,
+                    "num_tokens": self.training.num_tokens,
+                    "learning_rate": self.training.learning_rate,
+                },
+                "eval_history": [
+                    {
+                        "step": e.step,
+                        "dataset": e.dataset,
+                        "success_rate": e.success_rate,
+                        "solved": e.solved,
+                        "total": e.total,
+                        "errors": e.errors,
+                        "timestamp": e.timestamp,
+                    }
+                    for e in self.eval_history
+                ],
+                "eval_progress": self.eval_progress.to_dict(),
+                "local_actors": {
+                    str(actor_id): {
+                        "id": a.id,
+                        "state": a.state,
+                        "games_played": a.games_played,
+                        "games_solved": a.games_solved,
+                        "current_theorem": a.current_theorem[:60]
+                        if a.current_theorem
+                        else "",
+                    }
+                    for actor_id, a in self.local_actors.items()
+                },
+                "gpus": [
+                    {
+                        "id": g.id,
+                        "name": g.name,
+                        "utilization": g.utilization,
+                        "memory_used": g.memory_used,
+                        "memory_total": g.memory_total,
+                        "inference_queue_size": g.inference_queue_size,
+                        "avg_wait_time_ms": g.avg_wait_time_ms,
+                    }
+                    for g in self.gpus
+                ],
+                "lean_server": {
+                    "address": self.lean_server.address,
+                    "port": self.lean_server.port,
+                    "connected": self.lean_server.connected,
+                    "available_processes": self.lean_server.available_processes,
+                    "used_processes": self.lean_server.used_processes,
+                    "max_processes": self.lean_server.max_processes,
+                    "starting_processes": self.lean_server.starting_processes,
+                    "stopping_processes": self.lean_server.stopping_processes,
+                    "total_processes": self.lean_server.total_processes,
+                    "idle_too_long_60s": self.lean_server.idle_too_long_60s,
+                    "cpu_percent": self.lean_server.cpu_percent,
+                    "ram_percent": self.lean_server.ram_percent,
+                    "ram_used_gb": self.lean_server.ram_used_gb,
+                    "ram_total_gb": self.lean_server.ram_total_gb,
+                    "error": self.lean_server.error,
+                },
+                "lean_servers": [
+                    {
+                        "address": s.address,
+                        "port": s.port,
+                        "connected": s.connected,
+                        "available_processes": s.available_processes,
+                        "used_processes": s.used_processes,
+                        "max_processes": s.max_processes,
+                        "cpu_percent": s.cpu_percent,
+                        "ram_percent": s.ram_percent,
+                        "ram_used_gb": s.ram_used_gb,
+                        "ram_total_gb": s.ram_total_gb,
+                        "leanserver_rss_gb": s.leanserver_rss_gb,
+                        "total_branches": s.total_branches,
+                        "starting_processes": s.starting_processes,
+                        "stopping_processes": s.stopping_processes,
+                        "total_processes": s.total_processes,
+                        "idle_too_long_60s": s.idle_too_long_60s,
+                        "error": s.error,
+                    }
+                    for s in self.lean_servers
+                ],
+            }
+
+    # --- State update methods ---
+
+    def set_phase(self, phase: Phase):
+        with self._lock:
+            self.phase = phase
+            if phase == "collecting":
+                self.collection.reset()
+
+    def set_step(self, step: int):
+        with self._lock:
+            self.step = step
+
+    def set_replay_buffer_size(self, size: int):
+        with self._lock:
+            self.replay_buffer_size = size
+
+    def set_negative_buffer_size(self, size: int):
+        with self._lock:
+            self.negative_buffer_size = size
+
+    def _phase_file(self, subdir: str, filename: str) -> str | None:
+        """Resolve a file path under ``output_dir/<subdir>/<filename>``."""
+        with self._lock:
+            output_dir = self.output_dir
+        if not output_dir:
+            return None
+        return os.path.join(output_dir, subdir, filename)
+
+    def _tail_run_log(self, filename: str, n: int) -> list[str]:
+        """Tail the last ``n`` lines of ``<output_dir>/<filename>``."""
+        with self._lock:
+            output_dir = self.output_dir
+        if not output_dir:
+            return []
+        return _tail_lines(os.path.join(output_dir, filename), n)
+
+    def set_output_dir(self, output_dir: str):
+        with self._lock:
+            self.output_dir = output_dir
+            # Open timeline files for append
+            if self._timeline_file is not None:
+                self._timeline_file.close()
+            timeline_path = os.path.join(output_dir, "timeline.jsonl")
+            self._timeline_file = open(timeline_path, "a")
+            if self._inference_timeline_file is not None:
+                self._inference_timeline_file.close()
+            inference_timeline_path = os.path.join(
+                output_dir, "inference_timeline.jsonl"
+            )
+            self._inference_timeline_file = open(inference_timeline_path, "a")
+
+    def start_collection(self, target_samples: int, num_actors: int):
+        with self._lock:
+            self.phase = "collecting"
+            self.collection.reset()
+            self.collection.target_samples = target_samples
+            self.collection.num_actors = num_actors
+            self.replay_buffer_base_size = self.replay_buffer_size
+
+    def record_proof_attempt(self, successful: bool, transitions: int = 0):
+        with self._lock:
+            self.collection.proofs_attempted += 1
+            if successful:
+                self.collection.proofs_successful += 1
+                self.collection.samples_collected += transitions
+
+    def add_collected_samples(self, count: int):
+        """Bump the samples_collected counter (for the progress bar)."""
+        with self._lock:
+            self.collection.samples_collected += count
+
+    def record_expansion(self):
+        with self._lock:
+            self.collection.expansions += 1
+
+    def record_batch_wait(self, wait_time: float):
+        self.collection.record_wait_time(wait_time)
+
+    def update_collection_stats(
+        self, proofs_attempted: int = 0, proofs_successful: int = 0, expansions: int = 0
+    ):
+        """Update collection stats from distributed mode metrics."""
+        with self._lock:
+            self.collection.proofs_attempted = proofs_attempted
+            self.collection.proofs_successful = proofs_successful
+            if expansions > 0:
+                self.collection.expansions = expansions
+
+    def update_training(
+        self,
+        step: int,
+        loss: float,
+        num_tokens: int = 0,
+        lr: float = 0.0,
+        loss_positive: float = 0.0,
+        loss_negative: float = 0.0,
+    ):
+        with self._lock:
+            self.phase = "training"
+            self.training.step = step
+            self.training.loss = loss
+            self.training.loss_positive = loss_positive
+            self.training.loss_negative = loss_negative
+            self.training.num_tokens = num_tokens
+            self.training.learning_rate = lr
+
+    def record_eval(
+        self,
+        step: int,
+        dataset: str,
+        success_rate: float,
+        solved: int,
+        total: int,
+        errors: int,
+    ):
+        with self._lock:
+            self.eval_history.append(
+                EvalResult(
+                    step=step,
+                    dataset=dataset,
+                    success_rate=success_rate,
+                    solved=solved,
+                    total=total,
+                    errors=errors,
+                )
+            )
+
+    def start_eval(self, dataset: str, total: int):
+        """Start tracking evaluation progress."""
+        with self._lock:
+            self.eval_progress = EvalProgress(
+                dataset=dataset,
+                current=0,
+                total=total,
+                solved=0,
+                errors=0,
+                active=True,
+            )
+
+    def update_eval_progress(self, current: int, solved: int, errors: int):
+        """Update evaluation progress."""
+        with self._lock:
+            self.eval_progress.current = current
+            self.eval_progress.solved = solved
+            self.eval_progress.errors = errors
+
+    # --- Prover server updates ---
+
+    # --- Local actor updates ---
+
+    def update_local_actor(
+        self,
+        actor_id: int,
+        state: str = "running",
+        games_played: int | None = None,
+        games_solved: int | None = None,
+        current_theorem: str = "",
+    ):
+        """Update status of a local actor."""
+        with self._lock:
+            if actor_id not in self.local_actors:
+                self.local_actors[actor_id] = LocalActorStatus(id=actor_id)
+
+            actor = self.local_actors[actor_id]
+            actor.state = state
+            if games_played is not None:
+                actor.games_played = games_played
+            if games_solved is not None:
+                actor.games_solved = games_solved
+            actor.current_theorem = current_theorem
+            actor.last_update = time.time()
+
+    def clear_local_actors(self):
+        """Clear all local actors (called when collection ends)."""
+        with self._lock:
+            self.local_actors.clear()
+
+    # --- Metrics exporter for wandb/goodseed ---
+
+    def lean_server_metrics(self) -> dict[str, float]:
+        """Per-leanserver metrics flattened into a wandb-friendly dict.
+
+        Call once per training step and splat into ``run_log.log(...)``.
+        Returned keys look like::
+
+            monitoring/lean/10_10_25_36/ram_percent
+            monitoring/lean/10_10_25_36/used_processes
+            monitoring/lean/10_10_25_36/connected   # 1 if last poll succeeded
+
+        Dots in IP addresses are replaced with underscores so wandb groups
+        the series sensibly under the "monitoring/" section in the sidebar
+        rather than being treated as nested fields.  All values are scalars
+        so they pass the safe-filter in MetricsLogger.log.
+        """
+        metrics: dict[str, float] = {}
+        with self._lock:
+            servers = list(self.lean_servers)
+        for s in servers:
+            if not s.address:
+                continue
+            host_key = s.address.replace(".", "_")
+            prefix = f"monitoring/lean/{host_key}"
+            metrics[f"{prefix}/connected"] = 1.0 if s.connected else 0.0
+            if s.ram_percent is not None:
+                metrics[f"{prefix}/ram_percent"] = float(s.ram_percent)
+            if s.used_processes is not None:
+                metrics[f"{prefix}/used_processes"] = float(s.used_processes)
+        return metrics
+
+    # --- Timeline instrumentation ---
+
+    def record_timeline_events(self, actor_id: int, events: list[TimelineEvent]):
+        """Record timeline events from a completed proof attempt.
+
+        ``llm`` events are clipped against training intervals. A
+        sample_tactic call that straddles a train pause would otherwise
+        record a single event spanning the whole pause, making the actor
+        look busy in the profiler even though it was blocked waiting on
+        paused inference. The clip splits such events into the
+        pre-pause and post-resume sub-ranges, which is what the actor
+        actually did LLM work for.
+        """
+        with self._lock:
+            if actor_id not in self.actor_timelines:
+                self.actor_timelines[actor_id] = deque(
+                    maxlen=self._max_timeline_events_per_actor
+                )
+            buf = self.actor_timelines[actor_id]
+            train_intervals = self._train_intervals_locked()
+            for ev in events:
+                subranges = (
+                    _clip_against(ev.start, ev.end, train_intervals)
+                    if ev.type == "llm"
+                    else [(ev.start, ev.end)]
+                )
+                for start, end in subranges:
+                    self._instr_seq += 1
+                    d = {
+                        "type": ev.type,
+                        "start": start,
+                        "end": end,
+                        "seq": self._instr_seq,
+                    }
+                    buf.append(d)
+                    if self._timeline_file is not None:
+                        self._timeline_file.write(
+                            json.dumps(
+                                {
+                                    "type": "actor",
+                                    "actor": actor_id,
+                                    "event": d["type"],
+                                    "start": d["start"],
+                                    "end": d["end"],
+                                }
+                            )
+                            + "\n"
+                        )
+            if self._timeline_file is not None:
+                self._timeline_file.flush()
+
+    def _train_intervals_locked(self) -> list[tuple[float, float]]:
+        """Return sorted, non-overlapping ``(start, end)`` ranges for every
+        completed ``train`` phase. Must be called with ``self._lock`` held.
+        A still-open train phase is treated as extending to ``now``, so
+        events recorded exactly at resume/end handoff time are clipped too.
+        """
+        intervals: list[tuple[float, float]] = []
+        start: float | None = None
+        for ev in self.phase_events:
+            if ev.get("name") != "train":
+                continue
+            action = ev.get("action")
+            if action == "start":
+                start = ev["time"]
+            elif action == "end" and start is not None:
+                intervals.append((start, ev["time"]))
+                start = None
+        if start is not None:
+            intervals.append((start, time.time()))
+        return intervals
+
+    def record_outcome(self, actor_id: int, kind: str):
+        """Record a per-actor proof-attempt outcome.
+
+        kind: "solved" | "gave_up" | "interrupted". Rendered in the profiler as
+        a per-row marker at the time of the call.
+        """
+        with self._lock:
+            if actor_id not in self.actor_outcomes:
+                self.actor_outcomes[actor_id] = deque(
+                    maxlen=self._max_timeline_events_per_actor
+                )
+            self._instr_seq += 1
+            entry = {"t": time.time(), "kind": kind, "seq": self._instr_seq}
+            self.actor_outcomes[actor_id].append(entry)
+            if self._timeline_file is not None:
+                self._timeline_file.write(
+                    json.dumps(
+                        {
+                            "type": "outcome",
+                            "actor": actor_id,
+                            "kind": kind,
+                            "t": entry["t"],
+                        }
+                    )
+                    + "\n"
+                )
+                self._timeline_file.flush()
+
+    def record_phase_event(self, name: str, action: str):
+        """Record a global phase event (start/end of collect, eval, train).
+
+        Phase transitions are globally synchronized across DDP ranks, so we
+        only log from rank 0. Without this guard, an 8-rank run would write
+        8 near-duplicate entries per transition (one per process) into the
+        shared timeline.jsonl.
+        """
+        if not is_master():
+            return
+        with self._lock:
+            self._instr_seq += 1
+            entry = {
+                "type": "phase",
+                "name": name,
+                "action": action,
+                "time": time.time(),
+                "seq": self._instr_seq,
+            }
+            self.phase_events.append(entry)
+            if self._timeline_file is not None:
+                # seq is in-memory only; the on-disk log is indexed by
+                # (time, action) which is sufficient for post-hoc replay.
+                file_entry = {
+                    "type": "phase",
+                    "name": name,
+                    "action": action,
+                    "time": entry["time"],
+                }
+                self._timeline_file.write(json.dumps(file_entry) + "\n")
+                self._timeline_file.flush()
+
+    # --- GPU updates ---
+
+    def update_gpu(
+        self,
+        gpu_id: int,
+        name: str = "",
+        utilization: float = 0.0,
+        memory_used: int = 0,
+        memory_total: int = 0,
+        inference_queue_size: int = 0,
+        avg_wait_time_ms: float = 0.0,
+    ):
+        """Update GPU status."""
+        with self._lock:
+            # Find or create GPU entry
+            gpu = None
+            for g in self.gpus:
+                if g.id == gpu_id:
+                    gpu = g
+                    break
+
+            if gpu is None:
+                gpu = GPUStatus(id=gpu_id)
+                self.gpus.append(gpu)
+
+            gpu.name = name or gpu.name
+            gpu.utilization = utilization
+            gpu.memory_used = memory_used
+            gpu.memory_total = memory_total
+            gpu.inference_queue_size = inference_queue_size
+            gpu.avg_wait_time_ms = avg_wait_time_ms
+
+
+# Alias for backwards compatibility
+RLMonitor = WebMonitor
+
+# Global monitor instance
+_monitor: WebMonitor | None = None
+
+
+def get_monitor() -> WebMonitor | None:
+    """Get the global monitor instance."""
+    return _monitor
+
+
+def set_monitor(monitor: WebMonitor):
+    """Set the global monitor instance."""
+    global _monitor
+    _monitor = monitor
+
+
+def create_monitor(
+    num_actors: int = 0, enabled: bool = True, port: int = 5050
+) -> WebMonitor:
+    """Create and set a new global monitor."""
+    monitor = WebMonitor(num_actors=num_actors, enabled=enabled, port=port)
+    set_monitor(monitor)
+    return monitor
+
+
+def run_standalone(run_dir: str, port: int = 5050):
+    """Launch the web monitor in standalone mode on a finished run directory.
+
+    The Profiler and Data tabs both read from disk, so they work identically
+    against a finished run. The Main tab degrades gracefully to empty stats.
+    """
+    if not os.path.isdir(run_dir):
+        print(f"Error: {run_dir} is not a directory")
+        sys.exit(1)
+
+    monitor = WebMonitor(enabled=True, port=port)
+    monitor.mode = "standalone"
+    monitor.output_dir = run_dir
+    set_monitor(monitor)
+
+    print(f"Serving: {run_dir}")
+    # Block forever (the Flask server runs in a daemon thread)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Launch nanoproof web monitor on a run directory",
+        allow_abbrev=False,
+    )
+    parser.add_argument("run_dir", help="Path to the RL run output directory")
+    parser.add_argument(
+        "--port", type=int, default=5050, help="Port for the web server (default: 5050)"
+    )
+    args = parser.parse_args()
+    run_standalone(args.run_dir, args.port)
